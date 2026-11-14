@@ -1,0 +1,16 @@
+{
+  "name": "PlayDeck",
+  "author": "Nexus contributors",
+  "version": "0.1.0",
+  "api_version": 2,
+  "main": "dist/index.js",
+  "flags": [],
+  "publish": {
+    "tags": [
+      "playstation",
+      "friends",
+      "messaging"
+    ],
+    "description": "PlayStation Network friends, messaging, and party sessions."
+  }
+}
