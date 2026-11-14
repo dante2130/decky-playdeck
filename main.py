@@ -3,13 +3,14 @@ import asyncio
 import json
 import os
 import re
+import ssl
 import tempfile
 import time
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 import decky
 
@@ -39,9 +40,18 @@ class PsnError(ValueError):
         super().__init__(f"PlayStation Network returned HTTP {status}.")
 
 
+def tls_context():
+    # Decky's bundled Python can point at a certificate directory from its build host.
+    for bundle in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem",
+                   "/etc/pki/tls/certs/ca-bundle.crt"):
+        if Path(bundle).is_file():
+            return ssl.create_default_context(cafile=bundle)
+    return ssl.create_default_context()
+
+
 def request(url, method="GET", headers=None, body=None, redirect=False):
     try:
-        with build_opener(NoRedirect()).open(Request(url, body, headers or {}, method=method), timeout=20) as reply:
+        with build_opener(NoRedirect(), HTTPSHandler(context=tls_context())).open(Request(url, body, headers or {}, method=method), timeout=20) as reply:
             raw = reply.read(8 * 1024 * 1024 + 1)
             if len(raw) > 8 * 1024 * 1024:
                 raise ValueError("PlayStation Network response is too large.")
@@ -50,8 +60,13 @@ def request(url, method="GET", headers=None, body=None, redirect=False):
         if redirect and error.code in (302, 303):
             return error.headers.get("Location", "")
         raise PsnError(error.code) from None
-    except (URLError, TimeoutError):
-        raise ValueError("Could not reach PlayStation Network. Try again.") from None
+    except (URLError, TimeoutError) as error:
+        reason = getattr(error, "reason", error)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise ValueError("Could not verify Sony’s TLS certificate. Check the system clock and certificate store.") from None
+        if isinstance(reason, TimeoutError):
+            raise ValueError("The connection to PlayStation Network timed out.") from None
+        raise ValueError("Could not reach PlayStation Network. Check your internet connection and retry.") from None
 
 
 def identifier(value):

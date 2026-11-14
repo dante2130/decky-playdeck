@@ -197,6 +197,7 @@ function SocialPanel() {
   const { run, busy, error } = useTask();
   const [session, setSession] = useState<Session | null>();
   const [code, setCode] = useState("");
+  const [connecting, setConnecting] = useState(false);
   const [tab, setTab] = useState<Tab>("Friends");
   const [inbox, setInbox] = useState<Chat[]>();
   const [parties, setParties] = useState<Party[]>();
@@ -245,12 +246,18 @@ function SocialPanel() {
           Get Sony NPSSO code
         </DialogButton>
       </PanelSectionRow>
-      <PanelSectionRow><TextField bIsPassword label="Sony NPSSO code" value={code} onChange={event => setCode(event.currentTarget.value)} /></PanelSectionRow>
+      <PanelSectionRow><TextField bIsPassword label="Sony NPSSO code" disabled={busy} value={code} onChange={event => setCode(event.currentTarget.value)} /></PanelSectionRow>
       <PanelSectionRow><DialogButton disabled={busy || !code.trim()} onClick={() => void run(async () => {
-        await api.signIn(code);
-        setCode("");
-        setSession(await api.load());
-      })}>Connect PlayStation Network</DialogButton></PanelSectionRow>
+        setConnecting(true);
+        try {
+          await api.signIn(code);
+          setCode("");
+          setSession(await api.load());
+        } finally {
+          setConnecting(false);
+        }
+      })}>{connecting ? "Connecting…" : "Connect PlayStation Network"}</DialogButton></PanelSectionRow>
+      {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
       <PanelSectionRow><DialogButton disabled={busy} onClick={() => void run(async () => setSession(await api.load()))}>Retry</DialogButton></PanelSectionRow>
     </>}
     {session && <>
@@ -309,8 +316,8 @@ function SocialPanel() {
         setTab("Friends");
       })}>Disconnect PlayStation Network</DialogButton></PanelSectionRow>
     </>}
-    {busy && <PanelSectionRow><div role="status">Working…</div></PanelSectionRow>}
-    {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
+    {busy && !connecting && <PanelSectionRow><div role="status">Working…</div></PanelSectionRow>}
+    {session && error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
   </PanelSection>;
 }
 
