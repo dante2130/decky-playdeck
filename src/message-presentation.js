@@ -41,7 +41,7 @@ export function scrollConversationHistory(element, event) {
         return false;
     const step = Math.max(48, element.clientHeight * 0.65);
     const next = Math.max(0, Math.min(limit, top + (button === 9 ? -step : step)));
-    element.scrollBy({ top: next - top, behavior: "smooth" });
+    element.scrollTop = next;
     event.preventDefault();
     event.stopPropagation();
     return true;

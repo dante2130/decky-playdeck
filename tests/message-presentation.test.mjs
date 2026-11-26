@@ -34,8 +34,7 @@ test('group and empty conversations do not show an individual’s presence badge
 
 test('controller scroll consumes up/down only while history can move', async () => {
     const { scrollConversationHistory } = await import('../src/message-presentation.js');
-    const element = { scrollTop: 500, scrollHeight: 1000, clientHeight: 200,
-        scrollBy({ top }) { this.scrollTop += top; } };
+    const element = { scrollTop: 500, scrollHeight: 1000, clientHeight: 200 };
     function event(button) { return { detail: { button, is_repeat: true }, prevented: false, stopped: false,
         preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } }; }
     const up = event(9);

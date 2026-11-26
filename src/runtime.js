@@ -1406,7 +1406,7 @@ function Conversation({ me, title, chat, closeModal, changed }) {
                 focusClassName: "playdeck-history-focused", actionDescriptionMap: { 9: "Scroll up", 10: "Scroll down" },
                 onGamepadDirection: event => scrollConversationHistory(history.current, event),
                 onKeyDown: event => scrollConversationHistory(history.current, event),
-                style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", overscrollBehavior: "contain", padding: 6 } },
+                style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", scrollBehavior: "auto", overscrollBehavior: "contain", padding: 6 } },
                 !messages.length && SP_REACT.createElement("p", null, busy ? "Loading conversation…" : "No messages."),
                 messages.map((item, index) => {
                     const mine = item.sender === me;
