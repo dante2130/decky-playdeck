@@ -117,6 +117,13 @@ def identifier(value):
     return value
 
 
+def conversation_identifier(value):
+    # Direct-message group/thread IDs use dots and tildes; all are URL-unreserved characters.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.~-]{1,128}", value) or value in (".", ".."):
+        raise ValueError("Invalid PlayStation conversation identifier.")
+    return value
+
+
 def avatar_urls(row):
     personal = row.get("personalDetail") or {}
     candidates = [row.get("profilePicUrl")]
@@ -475,7 +482,7 @@ class Plugin:
         return {"id": result["groupId"], "thread": (result.get("mainThread") or {}).get("threadId") or result["groupId"]}
 
     async def messages(self, group, thread):
-        path = f"{GROUPS}/members/me/groups/{identifier(group)}/threads/{identifier(thread)}/messages"
+        path = f"{GROUPS}/members/me/groups/{conversation_identifier(group)}/threads/{conversation_identifier(thread)}/messages"
         result = await self._api(path)
         people = {}
         for row in result["messages"]:
@@ -495,7 +502,7 @@ class Plugin:
     async def send_message(self, group, thread, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 256:
             raise ValueError("Enter a message of up to 256 characters.")
-        await self._api(f"{GROUPS}/groups/{identifier(group)}/threads/{identifier(thread)}/messages",
+        await self._api(f"{GROUPS}/groups/{conversation_identifier(group)}/threads/{conversation_identifier(thread)}/messages",
                         "POST", {"messageType": 1, "body": text.strip()})
 
     async def parties(self):
