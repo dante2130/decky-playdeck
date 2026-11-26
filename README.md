@@ -12,6 +12,8 @@ Native party voice uses Sony’s voice bridge. Joining connects voice automatica
 
 This plugin uses undocumented PSN endpoints. The build and native relay tests pass. Party voice was verified between PlayDeck on SteamOS and PlayStation App on Android, including audio from the Deck microphone on the Android device.
 
+The Steam left-menu entry opens PlayDeck in a dialog over the current Steam screen. Close the dialog to return to that screen.
+
 ## Message attachments
 
 Stickers display directly in the conversation. Images and videos show clickable previews that open the attachment viewer. Previews load as you scroll; videos do not play automatically. Use LB/RB to scroll message history while focusing attachment buttons. The viewer fills the available width. Videos support playback controls; on a controller, A plays or pauses, left/right seek 10 seconds, and B closes the viewer. File links are available when Sony supplies them. Deleted or expired media displays an error with a retry option.

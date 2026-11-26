@@ -1484,14 +1484,17 @@ function MessageAttachments({ chat, message }) {
     return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end", width: "100%", marginTop: message.text ? 6 : 0, maxWidth: "100%" } },
         message.attachments.map((attachment, index) => SP_REACT.createElement(AttachmentTile, { key: index, chat, message, attachment, index })));
 }
-function Conversation({ me, title, chat, profiles = [], closeModal, changed }) {
+function Conversation({ me, title, chat, profiles = [], onOpenParty, closeModal, changed }) {
     const { run, busy, error } = useTask();
     const voice = useSharedPartyVoice();
     const [createdParty, setCreatedParty] = SP_REACT.useState();
     function openParty() {
         closeModal?.();
-        DFL.Navigation.Navigate("/playdeck/party");
-        DFL.Navigation.CloseSideMenus();
+        if (onOpenParty) onOpenParty();
+        else {
+            DFL.Navigation.Navigate("/playdeck/party");
+            DFL.Navigation.CloseSideMenus();
+        }
     }
     async function createGroupParty() {
         const { failedInvites } = await createConversationParty(api, chat.members, me, party => {
@@ -1692,7 +1695,7 @@ function AccountSettings({ session, connected, disconnect, voiceMode, changeVoic
         busy && SP_REACT.createElement("div", { role: "status" }, "Connecting..."),
         error && SP_REACT.createElement("div", { role: "alert" }, error));
 }
-function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
+function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenParty }) {
     const { run, busy, error } = useTask();
     const voice = useSharedPartyVoice();
     const [session, setSession] = SP_REACT.useState();
@@ -1718,7 +1721,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
     function openChat(chat, label, me) {
         const profiles = [me, ...session.friends];
         const conversation = { ...chat, members: (chat.members ?? []).map(member => messageParticipant(member, profiles)) };
-        DFL.showModal(SP_REACT.createElement(Conversation, { me: me.id, title: label, chat: conversation, profiles, changed: () => setInboxDirty(true) }));
+        DFL.showModal(SP_REACT.createElement(Conversation, { me: me.id, title: label, chat: conversation, profiles, onOpenParty, changed: () => setInboxDirty(true) }));
     }
     function messagePlayer(player) {
         if (!session || player.id === session.me.id)
@@ -1895,7 +1898,17 @@ var index = definePlugin(() => {
     const partyRoute = "/playdeck/party";
     const menuRoute = "/playdeck";
     const settingsRoute = "/playdeck/settings";
+    let disposed = false;
+    let popup;
+    let popupTimer;
+    function closePopup() {
+        clearTimeout(popupTimer);
+        popupTimer = undefined;
+        popup?.Close();
+        popup = undefined;
+    }
     function openRoute(route) {
+        if (route === partyRoute) closePopup();
         DFL.Navigation.Navigate(route);
         DFL.Navigation.CloseSideMenus();
     }
@@ -1910,8 +1923,40 @@ var index = definePlugin(() => {
                 event.target.scrollIntoView({ block: "nearest", inline: "nearest" });
         } }, SP_REACT.createElement(SocialPanel, props));
     }
+    function SocialPopup({ closeModal }) {
+        return SP_REACT.createElement(DFL.ModalRoot, { closeModal, onCancel: closeModal, bAllowFullSize: true, modalClassName: "playdeck-social-popup" },
+            SP_REACT.createElement("style", null, `
+                .playdeck-social-popup > .ModalPosition_Content { width: 100vw; max-width: 100vw; box-sizing: border-box; }
+                .playdeck-social-popup .DialogContentTransition,
+                .playdeck-social-popup .DialogContent.DialogContentFullSize,
+                .playdeck-social-popup .DialogContentFullSize > .DialogContent_InnerWidth { width: 100%; max-width: none; box-sizing: border-box; }
+            `),
+            SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: {
+                width: "100%", height: "min(680px, 75vh)", overflowY: "auto", boxSizing: "border-box",
+                padding: "16px 20px 24px", scrollPadding: "16px 0 24px",
+            }, onFocus: event => {
+                if (event.target !== event.currentTarget && event.target?.scrollIntoView)
+                    event.target.scrollIntoView({ block: "nearest", inline: "nearest" });
+            } },
+                SP_REACT.createElement("h1", { style: { margin: "0 12px 12px" } }, "PlayDeck"),
+                SP_REACT.createElement(SocialPanel, { onOpenParty: () => openRoute(partyRoute) })));
+    }
+    function SteamMenuPopupRoute() {
+        SP_REACT.useEffect(() => {
+            DFL.Navigation.NavigateBack();
+            if (disposed || popup || popupTimer !== undefined) return;
+            popupTimer = setTimeout(() => {
+                popupTimer = undefined;
+                if (disposed || popup) return;
+                popup = DFL.showModal(SP_REACT.createElement(SocialPopup, null), undefined, {
+                    bNeverPopOut: true, fnOnClose: () => { popup = undefined; },
+                });
+            }, 100);
+        }, []);
+        return null;
+    }
     routerHook.addRoute(partyRoute, () => routePanel({ initialTab: "Parties" }), { exact: true });
-    routerHook.addRoute(menuRoute, () => routePanel({}), { exact: true });
+    routerHook.addRoute(menuRoute, SteamMenuPopupRoute, { exact: true });
     routerHook.addRoute(settingsRoute, () => routePanel({ settingsOnOpen: true }), { exact: true });
     let menuPosition = 3;
     try {
@@ -1942,6 +1987,8 @@ var index = definePlugin(() => {
         content: SP_REACT.createElement(SocialPanel, null),
         icon: pluginIcon,
         onDismount() {
+            disposed = true;
+            closePopup();
             void voiceSnapshot.stop();
             removeMenu();
             partyBadge.remove();
