@@ -1,5 +1,5 @@
 import { attachPlayback } from "./attachment-playback.js";
-import { formatMessageDate, messageListPlayer, scrollConversationHistory, createConversationParty } from "./message-presentation.js";
+import { formatMessageDate, messageListPlayer, messageParticipant, scrollConversationHistory, createConversationParty } from "./message-presentation.js";
 import { installPartyBadge } from "./party-badge.js";
 import { installSteamMainMenuEntry } from "./steam-main-menu.js";
 import { partyMemberPresentation, bridgePeerState, readVoiceConnectionMode } from "./party-presentation.js";
@@ -1364,13 +1364,18 @@ function Dialog({ closeModal, title, children }) {
             SP_REACT.createElement("h2", { style: { margin: 0 } }, title),
             children));
 }
-function AttachmentViewer({ chat, message, index, attachment, closeModal }) {
+function AttachmentViewer({ chat, message, index, attachment, initialMedia, closeModal }) {
     const [media, setMedia] = SP_REACT.useState();
     const [error, setError] = SP_REACT.useState();
     const [attempt, setAttempt] = SP_REACT.useState(0);
     const player = SP_REACT.useRef(null);
     SP_REACT.useEffect(() => {
         let active = true;
+        if (initialMedia && attempt === 0) {
+            setMedia(initialMedia);
+            setError(undefined);
+            return;
+        }
         setMedia(undefined);
         setError(undefined);
         api.attachment(chat.id, chat.thread, message.id, index).then(result => {
@@ -1420,15 +1425,66 @@ function AttachmentViewer({ chat, message, index, attachment, closeModal }) {
                 onClick: () => window.SteamClient.System.OpenInSystemBrowser(media.downloadUrl),
             }, media.kind === "file" ? "Open / download file" : "Open in browser")));
 }
-function MessageAttachments({ chat, message }) {
-    return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6, flexWrap: "wrap", marginTop: message.text ? 6 : 0 } },
-        message.attachments.map((attachment, index) => SP_REACT.createElement(DFL.DialogButton, {
-            key: index, onGamepadFocus: event => event.currentTarget?.scrollIntoView({ block: "nearest" }),
-            onClick: () => DFL.showModal(SP_REACT.createElement(AttachmentViewer, { chat, message, index, attachment })),
-        }, attachment.kind === "video" ? "Play video" : attachment.kind === "audio" ? "Play voice message" :
-            attachment.kind === "file" ? `Open ${attachment.label}` : `View ${attachment.label.toLowerCase()}`)));
+function AttachmentTile({ chat, message, attachment, index }) {
+    const root = SP_REACT.useRef(null);
+    const [visible, setVisible] = SP_REACT.useState(false);
+    const [media, setMedia] = SP_REACT.useState();
+    const [failed, setFailed] = SP_REACT.useState(false);
+    const inline = attachment.inline || attachment.label === "Sticker";
+    const visual = attachment.kind === "image" || attachment.kind === "video";
+    SP_REACT.useEffect(() => {
+        if (inline || !visual) return;
+        const Observer = root.current?.ownerDocument?.defaultView?.IntersectionObserver ?? globalThis.IntersectionObserver;
+        if (typeof Observer !== "function") {
+            setVisible(true);
+            return;
+        }
+        const observer = new Observer(entries => {
+            if (entries.some(entry => entry.isIntersecting)) {
+                setVisible(true);
+                observer.disconnect();
+            }
+        }, { rootMargin: "120px" });
+        if (root.current) observer.observe(root.current);
+        return () => observer.disconnect();
+    }, [inline, visual]);
+    SP_REACT.useEffect(() => {
+        if (!visible || inline || !visual) return;
+        let active = true;
+        api.attachment(chat.id, chat.thread, message.id, index).then(result => {
+            if (active) setMedia(result);
+        }).catch(() => { if (active) setFailed(true); });
+        return () => { active = false; };
+    }, [visible, inline, visual, chat.id, chat.thread, message.id, index]);
+    if (inline) {
+        return SP_REACT.createElement("span", { "data-playdeck-sticker": true, style: { display: "grid", placeItems: "center", width: 160, height: 160, maxWidth: "100%" } },
+            attachment.preview && !failed ? SP_REACT.createElement("img", { src: attachment.preview, alt: "Sticker", loading: "lazy", referrerPolicy: "no-referrer",
+                style: { width: "100%", height: "100%", objectFit: "contain" }, onError: () => setFailed(true) }) :
+                SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, "Sticker unavailable"));
+    }
+    const preview = attachment.kind === "image" ? media?.url : media?.thumbnail ?? media?.preview;
+    const label = attachment.kind === "video" ? "Play video" : attachment.kind === "audio" ? "Play voice message" :
+        attachment.kind === "file" ? `Open ${attachment.label}` : `View ${attachment.label.toLowerCase()}`;
+    return SP_REACT.createElement("span", { ref: root, "data-playdeck-attachment": attachment.kind, style: { display: "block", maxWidth: "100%" } },
+        SP_REACT.createElement(DFL.DialogButton, { "aria-label": label, onOKActionDescription: label,
+            onGamepadFocus: event => event.currentTarget?.scrollIntoView({ block: "nearest" }),
+            style: { width: visual ? 240 : undefined, maxWidth: "100%", minWidth: 0, padding: 6, display: "flex", flexDirection: "column", gap: 5 },
+            onClick: () => DFL.showModal(SP_REACT.createElement(AttachmentViewer, { chat, message, index, attachment,
+                initialMedia: attachment.kind === "image" && media?.url?.startsWith("data:image/") ? media : undefined })),
+        },
+            visual && SP_REACT.createElement("span", { style: { width: "100%", height: 132, position: "relative", display: "grid", placeItems: "center", background: "#171c22", borderRadius: 4, overflow: "hidden" } },
+                preview && !failed && SP_REACT.createElement("img", { src: preview, alt: "", referrerPolicy: "no-referrer", onError: () => setFailed(true),
+                    style: { width: "100%", height: "100%", objectFit: "cover" } }),
+                (!preview || failed) && SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, failed ? "Preview unavailable" : "Loading preview..."),
+                attachment.kind === "video" && SP_REACT.createElement("span", { style: { position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "white", background: "#0003" }, "aria-hidden": true },
+                    SP_REACT.createElement("svg", { width: 36, height: 36, viewBox: "0 0 24 24", fill: "currentColor" }, SP_REACT.createElement("path", { d: "M8 4v16l13-8z" })))),
+            SP_REACT.createElement("span", { style: { fontSize: 12, overflowWrap: "anywhere" } }, label)));
 }
-function Conversation({ me, title, chat, closeModal, changed }) {
+function MessageAttachments({ chat, message }) {
+    return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end", width: "100%", marginTop: message.text ? 6 : 0, maxWidth: "100%" } },
+        message.attachments.map((attachment, index) => SP_REACT.createElement(AttachmentTile, { key: index, chat, message, attachment, index })));
+}
+function Conversation({ me, title, chat, profiles = [], closeModal, changed }) {
     const { run, busy, error } = useTask();
     const voice = useSharedPartyVoice();
     const [createdParty, setCreatedParty] = SP_REACT.useState();
@@ -1488,9 +1544,9 @@ function Conversation({ me, title, chat, closeModal, changed }) {
                     const mine = item.sender === me;
                     const date = formatMessageDate(item.date);
                     const member = chat.members.find(player => player.id === item.sender);
-                    const sender = { id: item.sender, name: item.name ?? member?.name ?? "Player",
-                        avatar: item.avatar ?? member?.avatar,
-                        avatars: [...new Set([...(item.avatars ?? []), ...(member?.avatars ?? [])])] };
+                    const sender = messageParticipant({ id: item.sender, name: item.name ?? member?.name ?? "Player",
+                        avatar: member?.avatar ?? item.avatar,
+                        avatars: [...new Set([...(member?.avatars ?? []), ...(item.avatars ?? [])])] }, profiles);
                     const avatar = groupChat && SP_REACT.createElement(ProfileAvatar, { player: sender, compact: true, showPresence: false });
                     return SP_REACT.createElement("div", { key: item.id || index, style: {
                             display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 8,
@@ -1660,7 +1716,9 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
         return chat.name || chat.members.filter(member => member.id !== me.id).map(member => member.name).join(", ") || "Conversation";
     }
     function openChat(chat, label, me) {
-        DFL.showModal(SP_REACT.createElement(Conversation, { me: me.id, title: label, chat: chat, changed: () => setInboxDirty(true) }));
+        const profiles = [me, ...session.friends];
+        const conversation = { ...chat, members: (chat.members ?? []).map(member => messageParticipant(member, profiles)) };
+        DFL.showModal(SP_REACT.createElement(Conversation, { me: me.id, title: label, chat: conversation, profiles, changed: () => setInboxDirty(true) }));
     }
     function messagePlayer(player) {
         if (!session || player.id === session.me.id)
@@ -1669,7 +1727,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
             const chats = await api.inbox();
             const existing = chats.find(chat => chat.members.length === 2 &&
                 chat.members.some(member => member.id === player.id) && chat.members.some(member => member.id === session.me.id));
-            openChat(existing ?? await api.createChat(player.id), player.name, session.me);
+            openChat(existing ?? { ...await api.createChat(player.id), members: [session.me, player] }, player.name, session.me);
         });
     }
     async function loadTab(next) {

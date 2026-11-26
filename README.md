@@ -14,7 +14,7 @@ This plugin uses undocumented PSN endpoints. The build and native relay tests pa
 
 ## Message attachments
 
-In a conversation, select **View image**, **View sticker**, or **Play video** to open an attachment. Use LB/RB to scroll message history while focusing attachment buttons. The viewer fills the available width. Videos support playback controls; on a controller, A plays or pauses, left/right seek 10 seconds, and B closes the viewer. File links are available when Sony supplies them. Deleted or expired media displays an error with a retry option.
+Stickers display directly in the conversation. Images and videos show clickable previews that open the attachment viewer. Previews load as you scroll; videos do not play automatically. Use LB/RB to scroll message history while focusing attachment buttons. The viewer fills the available width. Videos support playback controls; on a controller, A plays or pauses, left/right seek 10 seconds, and B closes the viewer. File links are available when Sony supplies them. Deleted or expired media displays an error with a retry option.
 
 Images can load through the authenticated message-resource endpoint. Streaming video uses bundled [HLS.js](https://github.com/video-dev/hls.js); its license is included in `third_party/hls.js-LICENSE.txt`. The Sony media endpoint sequence was checked against [psn-php’s Media implementation](https://github.com/Tustin/psn-php/blob/master/src/Model/Media.php).
 

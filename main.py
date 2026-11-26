@@ -231,6 +231,7 @@ def message_attachments(row):
         item = detail.get(key)
         if isinstance(item, dict):
             attachments.append({"kind": kind, "label": str(item.get("fileName") or label)[:160],
+                                "inline": key == "stickerMessageDetail",
                                 "ugcId": item.get("ugcId"), "resourceId": item.get("resourceId"),
                                 "url": attachment_url(item.get("imageUrl") or item.get("downloadUrl") or item.get("url"))})
     return attachments
@@ -240,13 +241,17 @@ def message(row):
     detail = row.get("messageDetail") or {}
     body = row.get("body") or detail.get("body")
     sender = row.get("sender") or {}
+    attachments = message_attachments(row)
+    if attachments and all(item["inline"] for item in attachments):
+        body = None
     return {
         "id": str(row.get("messageUid", "")),
         "text": body if isinstance(body, str) else None,
         "sender": str(sender.get("accountId", "")),
         "name": sender.get("onlineId"),
         "date": row.get("createdTimestamp"),
-        "attachments": [{"kind": item["kind"], "label": item["label"]} for item in message_attachments(row)],
+        "attachments": [{"kind": item["kind"], "label": item["label"], "inline": item["inline"],
+                         "preview": item["url"] if item["inline"] else None} for item in attachments],
     }
 
 
@@ -571,7 +576,8 @@ class Plugin:
                 if not url:
                     raise ValueError("Sony did not provide a supported attachment link.")
                 return {"kind": item["kind"], "label": item["label"], "url": url,
-                        "preview": attachment_url(urls.get("largePreviewImage")), "downloadUrl": url,
+                        "preview": attachment_url(urls.get("largePreviewImage")),
+                        "thumbnail": attachment_url(urls.get("smallPreviewImage")) or attachment_url(urls.get("largePreviewImage")), "downloadUrl": url,
                         "stream": "hls" if urlsplit(url).path.lower().endswith(".m3u8") else "file"}
             except (ValueError, OSError) as problem:
                 error = problem

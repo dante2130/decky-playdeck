@@ -16,6 +16,20 @@ class AttachmentParsingTests(unittest.TestCase):
             self.assertNotIn('resourceId', attachment)
         self.assertEqual(backend.message({'body': 'Text'})['attachments'], [])
 
+    def test_stickers_expose_inline_image_but_other_media_remains_lazy(self):
+        sticker = backend.message({'messageDetail': {'stickerMessageDetail': {'imageUrl': CDN}}})['attachments'][0]
+        self.assertTrue(sticker['inline'])
+        self.assertEqual(sticker['preview'], CDN)
+        image = backend.message({'messageDetail': {'imageMessageDetail': {'resourceId': 'resource'}}})['attachments'][0]
+        self.assertFalse(image['inline'])
+        self.assertIsNone(image['preview'])
+
+    def test_automatic_sticker_caption_is_hidden_but_normal_text_is_preserved(self):
+        sticker = backend.message({'body': 'User sent a sticker', 'messageDetail': {'stickerMessageDetail': {'imageUrl': CDN}}})
+        self.assertIsNone(sticker['text'])
+        self.assertTrue(sticker['attachments'][0]['inline'])
+        self.assertEqual(backend.message({'body': 'User sent a sticker'})['text'], 'User sent a sticker')
+
     def test_media_links_reject_active_or_local_urls_and_upgrade_legacy_stickers(self):
         self.assertEqual(backend.attachment_url(CDN), CDN)
         self.assertEqual(backend.attachment_url('http://static-resource.np.community.playstation.net/sticker.png'),
@@ -46,10 +60,11 @@ class AttachmentMediaTests(unittest.IsolatedAsyncioTestCase):
         self.row['messageDetail'] = {'videoMessageDetail': {'ugcId': 'ugc-1'}}
         mp4 = 'https://example.cloudfront.net/video.mp4?Signature=test'
         self.plugin._api = AsyncMock(side_effect=[{'messages': [self.row]}, {'ugcDocument': [{'id': 'media-1'}]},
-                                                 {'downloadUrl': mp4, 'videoUrl': 'https://example.cloudfront.net/video.m3u8'}])
+                                                 {'downloadUrl': mp4, 'videoUrl': 'https://example.cloudfront.net/video.m3u8', 'smallPreviewImage': CDN}])
         media = await self.plugin.attachment_media('g', 't', '1#12')
         self.assertEqual(media['url'], 'https://example.cloudfront.net/video.m3u8')
         self.assertEqual(media['stream'], 'hls')
+        self.assertEqual(media['thumbnail'], CDN)
 
     async def test_missing_message_cannot_resolve_unrelated_media(self):
         self.plugin._api = AsyncMock(return_value={'messages': []})

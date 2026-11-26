@@ -12,13 +12,15 @@ export function formatMessageDate(value) {
     return Number.isFinite(date.getTime()) ? date.toLocaleString() : "";
 }
 
+export function messageParticipant(member, profiles) {
+    const profile = profiles.find(player => player.id === member.id);
+    return { ...member, avatar: profile?.avatar ?? member.avatar,
+        avatars: [...new Set([profile?.avatar, ...(profile?.avatars ?? []), member.avatar, ...(member.avatars ?? [])].filter(Boolean))],
+        status: member.status ?? profile?.status, game: member.game ?? profile?.game };
+}
+
 export function messageListPlayer(chat, me, friends, name) {
-    const peers = chat.members.filter(member => member.id !== me).map(member => {
-        const friend = friends.find(player => player.id === member.id);
-        return { ...member, avatar: member.avatar ?? friend?.avatar,
-            avatars: [...new Set([...(member.avatars ?? []), ...(friend?.avatars ?? [])])],
-            status: member.status ?? friend?.status, game: member.game ?? friend?.game };
-    });
+    const peers = chat.members.filter(member => member.id !== me).map(member => messageParticipant(member, friends));
     const peer = peers[0];
     return {
         id: chat.id, name, avatar: peer?.avatar, avatars: peer?.avatars ?? [],

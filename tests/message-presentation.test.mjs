@@ -12,10 +12,10 @@ test('ISO dates work and missing or invalid dates do not display Invalid Date', 
     for (const value of [undefined, null, '', ' ', 'invalid', Infinity, {}, '999999999999999999999'])
         assert.equal(formatMessageDate(value), '');
 });
-test('direct-message avatars and badges use the same participant', () => {
+test('direct messages prefer Friends profile image and current participant presence', () => {
     const chat = { id: 'thread', members: [{ id: 'me' }, { id: 'other', avatar: 'photo', status: 'online' }] };
     const result = messageListPlayer(chat, 'me', [{ id: 'other', avatar: 'old', status: 'offline' }], 'Other');
-    assert.equal(result.avatar, 'photo');
+    assert.equal(result.avatar, 'old');
     assert.equal(result.status, 'online');
     assert.equal(result.hidePresence, false);
 });
@@ -84,4 +84,13 @@ test('history does not consume directions from attachment buttons', async () => 
     const event = { target, detail: { button: 10 }, preventDefault() { assert.fail('must allow attachment navigation'); }, stopPropagation() { assert.fail('must bubble'); } };
     assert.equal(scrollConversationHistory(element, event), false);
     assert.equal(element.scrollTop, 100);
+});
+
+
+test('group and sender rows use the same preferred Friends profile image', async () => {
+    const { messageParticipant } = await import('../src/message-presentation.js');
+    const profile = { id: 'friend', avatar: 'personal-photo', avatars: ['personal-photo', 'psn-avatar'] };
+    const member = { id: 'friend', avatar: 'messaging-avatar', status: 'online' };
+    assert.equal(messageParticipant(member, [profile]).avatar, profile.avatar);
+    assert.equal(messageListPlayer({ id: 'group', members: [member, { id: 'other' }] }, 'me', [profile], 'Group').avatarPlayers[0].avatar, profile.avatar);
 });
