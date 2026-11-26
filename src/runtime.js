@@ -1,3 +1,4 @@
+import { formatMessageDate, messageListPlayer, scrollConversationHistory, createConversationParty } from "./message-presentation.js";
 import { installPartyBadge } from "./party-badge.js";
 import { installSteamMainMenuEntry } from "./steam-main-menu.js";
 import { partyMemberPresentation, bridgePeerState, readVoiceConnectionMode } from "./party-presentation.js";
@@ -25,14 +26,22 @@ const definePlugin = (fn) => {
     };
 };
 
-function WideModal({ children, ...props }) {
-    return SP_REACT.createElement(DFL.ModalRoot, { ...props, bAllowFullSize: true, modalClassName: "nexus-wide-modal" },
+function WideModal({ children, fullWidth = false, ...props }) {
+    return SP_REACT.createElement(DFL.ModalRoot, { ...props, bAllowFullSize: true, modalClassName: `nexus-wide-modal${fullWidth ? " playdeck-conversation-modal" : ""}` },
         SP_REACT.createElement("style", null, `
       .nexus-wide-modal {
         width: calc(100vw - 32px) !important;
         max-width: none !important;
         box-sizing: border-box;
       }
+      .playdeck-conversation-modal .DialogContent,
+      .playdeck-conversation-modal .DialogContent_InnerWidth {
+        width: 100% !important;
+        max-width: none !important;
+        box-sizing: border-box;
+      }
+      .playdeck-conversation-modal form { width: 100%; min-width: 0; }
+      .playdeck-history-focused { outline: 2px solid #66c0f4; outline-offset: -2px; border-radius: 4px; }
     `),
         children);
 }
@@ -1244,6 +1253,8 @@ const rowStyles = `
   .psn-social-party-member .psn-social-player-copy strong { font-weight: 700; }
   .psn-social-party-member .psn-social-player-copy { line-height: 1.4; }
   .psn-social-player-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+  .psn-social-group-avatar { position: relative; width: 40px; height: 40px; flex: 0 0 40px; }
+  .psn-social-group-avatar .psn-social-player-avatar { width: 24px; height: 24px; flex-basis: 24px; font-size: 11px; box-shadow: 0 0 0 1px #25282c; }
   .psn-social-player-copy { flex: 1; min-width: 0; line-height: 1.4; }
   .psn-social-player-copy > * { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .psn-social-player-copy strong { font-size: 14px; font-weight: 650; }
@@ -1263,7 +1274,7 @@ function presenceTone(player) {
     const presence = playerPresence(player);
     return presence === "Online" ? "#78cf45" : presence === "Away" ? "#ffc95f" : "#a0a8b1";
 }
-function ProfileAvatar({ player, showPresence }) {
+function ProfileAvatar({ player, showPresence, compact = showPresence }) {
     const [failedAvatars, setFailedAvatars] = SP_REACT.useState([]);
     const [fallback, setFallback] = SP_REACT.useState();
     const primary = player.avatar ?? player.avatars?.[0];
@@ -1289,7 +1300,7 @@ function ProfileAvatar({ player, showPresence }) {
         void fetchFallback();
         return () => { active = false; };
     }, [avatar, primary, candidates]);
-    return SP_REACT.createElement("span", { className: showPresence ? "psn-social-player-avatar" : "psn-social-profile-avatar", "aria-hidden": player.muted || player.voiceError ? undefined : "true" },
+    return SP_REACT.createElement("span", { className: compact ? "psn-social-player-avatar" : "psn-social-profile-avatar", "aria-hidden": player.muted || player.voiceError ? undefined : "true" },
         Array.from(player.name)[0]?.toUpperCase(),
         avatar && SP_REACT.createElement("img", { key: avatar, src: avatar, alt: "", referrerPolicy: "no-referrer", onError: () => setFailedAvatars(previous => [...previous, avatar]) }),
         !avatar && fallbackImage && SP_REACT.createElement("img", { src: fallbackImage, alt: "", onError: event => { event.currentTarget.hidden = true; } }),
@@ -1297,6 +1308,12 @@ function ProfileAvatar({ player, showPresence }) {
             SP_REACT.createElement("svg", { width: 25, height: 25, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round", "aria-hidden": true },
                 SP_REACT.createElement("path", { d: player.voiceError ? "M12 3a3 3 0 00-3 3v6a3 3 0 006 0V6a3 3 0 00-3-3M5 11v1a7 7 0 007 7m0 0v3m-3 0h6M17 16l5 5m0-5-5 5" : "M3 3l18 18M9 9v3a3 3 0 005 2M15 9V5a3 3 0 00-6 0M5 10v2a7 7 0 0012 5M19 10v2M12 19v3M8 22h8" }))),
         showPresence && !player.voiceState && SP_REACT.createElement("span", { className: "psn-social-presence", style: { background: presenceTone(player) } }));
+}
+function GroupAvatar({ players }) {
+    return SP_REACT.createElement("span", { className: "psn-social-group-avatar", role: "img", "aria-label": `${players.length} participants` },
+        players.slice(0, 4).map((player, index) => SP_REACT.createElement("span", { key: player.id,
+            style: { position: "absolute", left: (index % 2) * 16, top: Math.floor(index / 2) * 16 } },
+            SP_REACT.createElement(ProfileAvatar, { player, compact: true, showPresence: false }))));
 }
 function PartyRowButton({ label, disabled, onClick, children }) {
     return SP_REACT.createElement(DFL.DialogButton, { "aria-label": label, onOKActionDescription: label, disabled, onClick,
@@ -1327,7 +1344,8 @@ function PartyMemberRow({ player, action }) {
 function PlayerRow({ player, detail, action, disabled }) {
     const presence = playerPresence(player);
     const content = SP_REACT.createElement("span", { className: "psn-social-player" },
-        SP_REACT.createElement(ProfileAvatar, { player: player, showPresence: true }),
+        player.avatarPlayers ? SP_REACT.createElement(GroupAvatar, { players: player.avatarPlayers }) :
+            SP_REACT.createElement(ProfileAvatar, { player: player, showPresence: !player.hidePresence, compact: true }),
         SP_REACT.createElement("span", { className: "psn-social-player-copy" },
             player.fullName && SP_REACT.createElement("span", { className: "psn-social-player-subtitle", title: player.name }, player.name),
             SP_REACT.createElement("strong", { title: player.fullName ?? player.name }, player.fullName ?? player.name),
@@ -1346,9 +1364,26 @@ function Dialog({ closeModal, title, children }) {
 }
 function Conversation({ me, title, chat, closeModal, changed }) {
     const { run, busy, error } = useTask();
+    const voice = useSharedPartyVoice();
+    const [createdParty, setCreatedParty] = SP_REACT.useState();
+    function openParty() {
+        closeModal?.();
+        DFL.Navigation.Navigate("/playdeck/party");
+        DFL.Navigation.CloseSideMenus();
+    }
+    async function createGroupParty() {
+        const { failedInvites } = await createConversationParty(api, chat.members, me, party => {
+            setCreatedParty(party);
+            void voice.start(party, readVoiceConnectionMode());
+        });
+        if (failedInvites)
+            throw new Error(`Party created, but ${failedInvites} group invitation(s) could not be sent. Open the party to invite members again.`);
+        openParty();
+    }
     const [messages, setMessages] = SP_REACT.useState([]);
     const [draft, setDraft] = SP_REACT.useState("");
     const history = SP_REACT.useRef(null);
+    const groupChat = chat.members.filter(member => member.id !== me).length > 1;
     async function refresh() {
         setMessages(await api.messages(chat.id, chat.thread));
     }
@@ -1357,26 +1392,45 @@ function Conversation({ me, title, chat, closeModal, changed }) {
         if (history.current)
             history.current.scrollTop = history.current.scrollHeight;
     }, [messages]);
-    return SP_REACT.createElement(WideModal, { closeModal: closeModal },
+    return SP_REACT.createElement(WideModal, { closeModal: closeModal, fullWidth: true },
         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { width: "100%", minWidth: 0, boxSizing: "border-box", height: "min(510px, 70vh)", display: "flex", flexDirection: "column", gap: 8 } },
             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
                 SP_REACT.createElement("h2", { style: { margin: 0 } }, title),
-                SP_REACT.createElement(ChatIcon, { label: "Refresh conversation", disabled: busy, onClick: () => void run(refresh) }, headerIcons.Refresh)),
-            SP_REACT.createElement("div", { ref: history, role: "log", "aria-label": "Conversation", tabIndex: 0, style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: 6 } },
+                SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
+                    chat.members.some(member => member.id !== me) && SP_REACT.createElement(ChatIcon, {
+                        label: createdParty ? "Open party" : "Create party", disabled: busy || voice.stopping || (!createdParty && Boolean(voice.activeParty)),
+                        onClick: () => createdParty ? openParty() : void run(createGroupParty),
+                    }, headerIcons.Parties),
+                    SP_REACT.createElement(ChatIcon, { label: "Refresh conversation", disabled: busy, onClick: () => void run(refresh) }, headerIcons.Refresh))),
+            SP_REACT.createElement(DFL.Focusable, { ref: history, role: "log", "aria-label": "Conversation", tabIndex: 0, focusableIfEmpty: true,
+                focusClassName: "playdeck-history-focused", actionDescriptionMap: { 9: "Scroll up", 10: "Scroll down" },
+                onGamepadDirection: event => scrollConversationHistory(history.current, event),
+                onKeyDown: event => scrollConversationHistory(history.current, event),
+                style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", overscrollBehavior: "contain", padding: 6 } },
                 !messages.length && SP_REACT.createElement("p", null, busy ? "Loading conversation…" : "No messages."),
                 messages.map((item, index) => {
                     const mine = item.sender === me;
+                    const date = formatMessageDate(item.date);
+                    const member = chat.members.find(player => player.id === item.sender);
+                    const sender = { id: item.sender, name: item.name ?? member?.name ?? "Player",
+                        avatar: item.avatar ?? member?.avatar,
+                        avatars: [...new Set([...(item.avatars ?? []), ...(member?.avatars ?? [])])] };
+                    const avatar = groupChat && SP_REACT.createElement(ProfileAvatar, { player: sender, compact: true, showPresence: false });
                     return SP_REACT.createElement("div", { key: item.id || index, style: {
-                            display: "flex", flexDirection: "column", alignItems: mine ? "flex-end" : "flex-start", marginBottom: 8,
+                            display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 8,
                         } },
-                        !mine && item.name && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, item.name),
-                        SP_REACT.createElement("div", { "aria-label": mine ? "You" : item.name ?? title, style: {
-                                maxWidth: "85%", padding: "7px 11px", color: "#fff",
-                                background: mine ? "#286c36" : "#353b42",
-                                borderRadius: mine ? "13px 13px 3px 13px" : "13px 13px 13px 3px",
-                                overflowWrap: "anywhere", whiteSpace: "pre-wrap",
-                            } }, item.text ?? "Attachment or system message"),
-                        item.date && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, new Date(item.date).toLocaleString()));
+                        !mine && avatar,
+                        SP_REACT.createElement("div", { style: { display: "flex", flexDirection: "column", flex: "1 1 0", minWidth: 0,
+                            alignItems: mine ? "flex-end" : "flex-start" } },
+                            !mine && item.name && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, item.name),
+                            SP_REACT.createElement("div", { "aria-label": mine ? "You" : item.name ?? title, style: {
+                                    maxWidth: "85%", padding: "7px 11px", color: "#fff",
+                                    background: mine ? "#286c36" : "#353b42",
+                                    borderRadius: mine ? "13px 13px 3px 13px" : "13px 13px 13px 3px",
+                                    overflowWrap: "anywhere", whiteSpace: "pre-wrap",
+                                } }, item.text ?? "Attachment or system message"),
+                            date && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, date)),
+                        mine && avatar);
                 })),
             error && SP_REACT.createElement("div", { role: "alert" }, error),
             SP_REACT.createElement(DFL.TextField, { label: "Message", value: draft, disabled: busy, inlineControls: SP_REACT.createElement(ChatIcon, { label: "Send message", disabled: busy || !draft.trim(), inline: true, onClick: () => void run(async () => {
@@ -1635,11 +1689,9 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                     SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0, textTransform: "none" } }, "Messages")),
                 inbox?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No conversations."),
                 SP_REACT.createElement("div", { className: "psn-social-list psn-social-group" }, inbox?.map(chat => {
-                    const peer = chat.members.find(member => member.id !== session.me.id);
                     const name = title(chat, session.me);
-                    const friend = session.friends.find(player => player.id === peer?.id);
                     const preview = chat.latest?.text ?? (chat.latest ? "Attachment or system message" : "No messages");
-                    return SP_REACT.createElement(PlayerRow, { key: chat.id, player: { id: chat.id, name, avatar: peer?.avatar ?? friend?.avatar, avatars: [...(peer?.avatars ?? []), ...(friend?.avatars ?? [])] }, detail: chat.unread ? `● ${preview}` : preview, disabled: busy, action: () => openChat(chat, name, session.me) });
+                    return SP_REACT.createElement(PlayerRow, { key: chat.id, player: messageListPlayer(chat, session.me.id, session.friends, name), detail: chat.unread ? `● ${preview}` : preview, disabled: busy, action: () => openChat(chat, name, session.me) });
                 }))),
             tab === "Parties" && SP_REACT.createElement(DFL.PanelSection, null,
                 !parties?.length && SP_REACT.createElement(DFL.PanelSectionRow, null,

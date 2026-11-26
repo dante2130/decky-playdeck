@@ -420,6 +420,29 @@ class Plugin:
             profiles.update({str(row["accountId"]): player(row) for row in result.get("profiles", [])})
         return [profiles.get(account) or {"id": account, "name": account} for account in dict.fromkeys(accounts)]
 
+    async def _update_profiles(self, players):
+        participants = {person["id"]: person for person in players}
+        missing = [account for account, member in participants.items() if not member.get("avatar")]
+        for offset in range(0, len(missing), 100):
+            batch = missing[offset:offset + 100]
+            query = urlencode({"accountIds": ",".join(batch)})
+            try:
+                response = await self._api(f"{USERS}/profiles?{query}")
+            except (ValueError, OSError):
+                continue
+            profiles = response.get("profiles", [])
+            names = {participants[account]["name"].casefold(): account for account in batch}
+            for index, row in enumerate(profiles):
+                if not isinstance(row, dict) or not row.get("onlineId"):
+                    continue
+                # This endpoint omits accountId; match Online IDs first, then its ordered response.
+                account = str(row.get("accountId") or names.get(row["onlineId"].casefold()) or
+                              (batch[index] if len(profiles) == len(batch) else ""))
+                if account in participants:
+                    profile = player({**row, "accountId": account})
+                    participants[account].update({key: value for key, value in profile.items()
+                                                   if value is not None and value != []})
+
     async def inbox(self):
         async def groups(favorite):
             query = urlencode(dict(favoriteFilter=favorite, includeFields=GROUP_FIELDS, limit=200))
@@ -435,6 +458,16 @@ class Plugin:
                 "unread": bool(thread.get("existsUnreadMessage")),
                 "latest": message(thread["latestMessage"]) if thread.get("latestMessage") else None,
             }
+        participants = {}
+        for chat in threads.values():
+            for member in chat["members"]:
+                existing = participants.get(member["id"])
+                if existing is None or (not existing.get("avatar") and member.get("avatar")):
+                    participants[member["id"]] = member
+        await self._update_profiles(list(participants.values()))
+        await self._update_presences(list(participants.values()))
+        for chat in threads.values():
+            chat["members"] = [participants[member["id"]] for member in chat["members"]]
         return sorted(threads.values(), key=lambda item: (item["latest"] or {}).get("date") or "", reverse=True)
 
     async def create_chat(self, account):
@@ -444,7 +477,20 @@ class Plugin:
     async def messages(self, group, thread):
         path = f"{GROUPS}/members/me/groups/{identifier(group)}/threads/{identifier(thread)}/messages"
         result = await self._api(path)
-        return sorted((message(row) for row in result["messages"]), key=lambda row: row["date"] or "")
+        people = {}
+        for row in result["messages"]:
+            sender = row.get("sender") or {}
+            if sender.get("accountId"):
+                people[str(sender["accountId"])] = player(sender)
+        await self._update_profiles(list(people.values()))
+        messages = []
+        for row in result["messages"]:
+            item = message(row)
+            profile = people.get(item["sender"], {})
+            item.update({"avatar": profile.get("avatar"), "avatars": profile.get("avatars", []),
+                         "name": profile.get("name") or item["name"]})
+            messages.append(item)
+        return sorted(messages, key=lambda row: row["date"] or "")
 
     async def send_message(self, group, thread, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 256:
