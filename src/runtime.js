@@ -1629,7 +1629,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { display: "grid", gap: 4 } },
                             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
                                 SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, party.name || "PlayStation party"),
-                                member && SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 4 } },
+                                member ? SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 4 } },
                                     SP_REACT.createElement(PartyRowButton, { label: voice.activeParty === party.id ? "Disconnect voice" : "Connect voice",
                                         disabled: busy || voice.stopping || Boolean(voice.activeParty && voice.activeParty !== party.id),
                                         onClick: () => voice.activeParty === party.id ? void voice.stop() : void voice.start(party.id, readVoiceConnectionMode()) },
@@ -1651,7 +1651,11 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                                             if (voice.activeParty === party.id) await voice.stop();
                                             await api.leave(party.id);
                                         }, "Party left.") },
-                                        SP_REACT.createElement("path", { d: "M10 4H4v16h6m-1-8h12m-4-4 4 4-4 4" })))),
+                                        SP_REACT.createElement("path", { d: "M10 4H4v16h6m-1-8h12m-4-4 4 4-4 4" }))) :
+                                    SP_REACT.createElement(PartyRowButton, { label: party.invited ? "Accept invitation" : "Join party",
+                                        disabled: busy || voice.stopping || Boolean(voice.activeParty),
+                                        onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, "Party joined.", true) },
+                                        SP_REACT.createElement("path", { d: "M14 4h6v16h-6M3 12h12m-4-4 4 4-4 4" }))),
                             party.members.map(player => SP_REACT.createElement(PartyMemberRow, { key: player.id,
                                 player: partyMemberPresentation(player, [session.me, ...session.friends].find(friend => friend.id === player.id), {
                                     self: player.id === session.me.id, active: voice.activeParty === party.id,
@@ -1659,10 +1663,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                                     failed: voice.status?.party === party.id && voice.status.error,
                                     peerStates: voice.peerStates, muted: voice.muted, startedAt: voice.startedAt,
                                 }) })),
-                            voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, voice.muteError),
-                            !member && SP_REACT.createElement(DFL.DialogButton, { disabled: busy || voice.stopping || Boolean(voice.activeParty),
-                                onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, "Party joined.", true) },
-                                party.invited ? "Accept invitation" : "Join party")));
+                            voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, voice.muteError)));
                 }))));
 }
 const pluginIcon = SP_REACT.createElement("svg", { width: "1em", height: "1em", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
