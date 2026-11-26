@@ -139,6 +139,40 @@ def avatar_urls(row):
     return urls
 
 
+def member_mute(row):
+    try:
+        fields = json.loads(base64.b64decode(row.get("customData4") or "", validate=True))
+        if isinstance(fields, list) and len(fields) > 5 and fields[5] in ("0", "1"):
+            return fields[5] == "1"
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def bridge_member_accounts(members, bridge_id):
+    accounts = {}
+    for member in members:
+        try:
+            fields = json.loads(base64.b64decode(member.get("customData4") or "", validate=True))
+            if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+                continue
+            bridge, peer = fields[PARTY_BRIDGE_DATA_SLOT].split("\n")
+            if bridge == bridge_id and member.get("accountId"):
+                accounts[identifier(peer)] = str(member["accountId"])
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return accounts
+
+
+def voice_member_data(row):
+    fields = json.loads(base64.b64decode(row.get("customData4") or PARTY_MEMBER_DATA, validate=True))
+    if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+        raise ValueError("Sony returned an unsupported party member data layout.")
+    fields[5] = "0"
+    fields[PARTY_BRIDGE_DATA_SLOT] = ""
+    return base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+
+
 def player(row):
     presence = (row.get("presences") or [{}])[0]
     avatars = avatar_urls(row)
@@ -154,6 +188,7 @@ def player(row):
         "status": row.get("primaryOnlineStatus") or presence.get("onlineStatus"),
         "game": presence.get("titleName") or presence.get("npTitleName"),
         "platform": presence.get("platform"),
+        "muted": member_mute(row),
         "level": (row.get("trophySummary") or {}).get("level"),
     }
 
@@ -436,6 +471,24 @@ class Plugin:
         } for row in result.get("parties", []) if row.get("sessionId")}
         for session_id in ids:
             parties.setdefault(session_id, {"id": session_id, "name": None, "members": [], "invited": True})
+        if parties:
+            try:
+                details = await self._api(f"{PARTIES}/partySessions?view=v3", headers={
+                    "X-PSN-SESSION-MANAGER-SESSION-IDS": ",".join(parties)})
+                for room in details.get("v2PartySessions", []):
+                    party = parties.get(room.get("sessionId"))
+                    if party:
+                        known = {member["id"]: member for member in party["members"]}
+                        members = []
+                        for row in room.get("members", []):
+                            if row.get("accountId"):
+                                member = known.get(str(row["accountId"])) or player(row)
+                                member["muted"] = member_mute(row)
+                                members.append(member)
+                        party["members"] = members
+            except (ValueError, OSError):
+                # Browsing parties remains available if full member data is restricted.
+                pass
         await self._update_presences([member for party in parties.values() for member in party["members"]])
         return list(parties.values())
 
@@ -573,7 +626,7 @@ class Plugin:
                      "peer": None, "clock_rate": 16000, "unlinked": not bridges, "published": False,
                      "identity": base64.b64encode(f"{session}\n{signaling_id}\n".encode()).decode(),
                      "account": account,
-                     "member_data": member.get("customData4") or PARTY_MEMBER_DATA}
+                     "member_data": voice_member_data(member)}
             self.bridge_voice = voice
             stage = "link the voice bridge to the party"
             try:
@@ -770,18 +823,20 @@ class Plugin:
                           if peer.get("peerId") and peer["peerId"] != voice["peer"]})
             identities = {}
             accounts = {}
+            muted = {}
             if ids:
                 try:
                     party = await self._refresh_voice_members(voice)
                     members = party.get("members", [])
                     identities = bridge_member_peers(members, session, voice["id"])
-                    accounts = {(member.get("deviceUniqueId") or "").lower(): str(member["accountId"])
-                                for member in members if member.get("accountId")}
+                    muted = {str(member.get("accountId")): member_mute(member) for member in members}
+                    accounts = bridge_member_accounts(members, voice["id"])
                 except (ValueError, OSError):
                     # Bridge media remains usable while the party member view is unavailable.
                     pass
             return [{"id": peer, "identity": identities.get(peer),
-                     "account": accounts.get((identities.get(peer) or "").lower())} for peer in ids]
+                     "account": accounts.get(peer),
+                     "muted": muted.get(accounts.get(peer))} for peer in ids]
 
     async def _stop_native_bridge(self, voice):
         process = voice.pop("native", None)
@@ -816,7 +871,7 @@ class Plugin:
         session = voice["session"]
         unavailable = "This party is no longer available. Refresh Parties and join a current party."
         try:
-            response = await self._api(f"{PARTIES}/partySessions",
+            response = await self._api(f"{PARTIES}/partySessions?view=v3",
                                        headers={"X-PSN-SESSION-MANAGER-SESSION-IDS": session})
         except PsnError as error:
             if error.status == 404:
@@ -830,6 +885,7 @@ class Plugin:
         voice["members"] = {str(member["accountId"]): member["platform"] for member in party.get("members", [])
                             if member.get("accountId") and str(member["accountId"]) != voice["account"]
                             and member.get("platform") in PLATFORMS}
+        voice["member_mutes"] = {str(member.get("accountId")): member_mute(member) for member in party.get("members", [])}
         voice["members_checked"] = time.monotonic()
         return party
 
@@ -847,7 +903,7 @@ class Plugin:
                 except Exception as error:
                     raise ValueError("Sony's party voice signaling connection closed.") from error
                 raise ValueError("Sony's party voice signaling connection closed.")
-            if time.monotonic() - voice["members_checked"] >= 8:
+            if time.monotonic() - voice["members_checked"] >= 2:
                 await self._refresh_voice_members(voice)
             descriptions = []
             while not push.frames.empty():
@@ -867,7 +923,7 @@ class Plugin:
                         decky.logger.info("Received PSN party voice %s from a party member.", description["type"])
                 else:
                     decky.logger.info("Ignored PSN custom message: sender is not in the active party.")
-            return {"members": list(voice["members"]), "descriptions": descriptions}
+            return {"members": list(voice["members"]), "descriptions": descriptions, "muted": voice.get("member_mutes", {})}
 
     async def send_voice_description(self, session, member, description):
         from voice_push import MAX_SDP, voice_payload

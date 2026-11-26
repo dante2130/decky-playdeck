@@ -4,7 +4,7 @@ export function partyMemberPresentation(player, profile, { self, active, connect
     const peer = peerStates?.[player.id];
     const state = failed ? "failed" : !active ? "idle" : self
         ? connected ? "connected" : "connecting" : peer?.state ?? (startedAt && now - startedAt >= 30000 ? "failed" : "connecting");
-    return { ...merged, self, voiceError: state === "failed", muted: self ? active && muted : peer?.muted === true,
+    return { ...merged, self, voiceError: state === "failed", muted: self ? active && muted : active && typeof peer?.muted === "boolean" ? peer.muted : player.muted === true,
         voiceState: state, detail: state === "connecting" ? "Connecting..." : state === "failed" ? "Connection error" : undefined };
 }
 

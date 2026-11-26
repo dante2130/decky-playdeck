@@ -483,6 +483,7 @@ function usePartyVoice() {
         setStatus({ party: call.party, connected, text });
         if (call.mode !== "server")
             setPeerStates(Object.fromEntries([...call.peers].map(([id, peer]) => [id, {
+                muted: call.memberMutes?.[id],
                 state: peer.connection.connectionState === "connected" ? "connected" :
                     peer.connection.connectionState === "failed" ? "failed" : "connecting",
             }])));
@@ -634,6 +635,7 @@ function usePartyVoice() {
         let userTableSequence = 0;
         const controlPeers = new Map();
         const peerAccounts = new Map();
+        const peerMutes = new Map();
         const peerFirstSeen = new Map();
         const openPeerAfter = new Map();
         function registerPeerControl(id, control, openedLocally) {
@@ -801,6 +803,13 @@ function usePartyVoice() {
             }
         };
         await applyOffer(offer);
+        if (active.current === call) {
+            try {
+                await setVoiceMute(call.party, !stream.getAudioTracks()[0].enabled);
+            } catch {
+                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+            }
+        }
         if (active.current !== call)
             return;
         waitForVoice(call);
@@ -845,7 +854,7 @@ function usePartyVoice() {
             }
             if (channel.readyState === "open" && (peersChanged || Date.now() >= refreshPeersAt)) {
                 peersChanged = false;
-                refreshPeersAt = Date.now() + 8000;
+                refreshPeersAt = Date.now() + 2000;
                 const bridgePeers = await bridgeVoicePeers(call.party);
                 if (active.current !== call)
                     return;
@@ -857,6 +866,7 @@ function usePartyVoice() {
                         entry.channel.close();
                         controlPeers.delete(id);
                         peerAccounts.delete(id);
+                        peerMutes.delete(id);
                         peerFirstSeen.delete(id);
                     }
                 }
@@ -864,7 +874,9 @@ function usePartyVoice() {
                     if (!knownPeers.has(id))
                         openPeerAfter.delete(id);
                 }
-                for (const { id, identity, account } of bridgePeers) {
+                for (const { id, identity, account, muted } of bridgePeers) {
+                    if (typeof muted === "boolean")
+                        peerMutes.set(id, muted);
                     if (account)
                         peerAccounts.set(id, [account]);
                     if (!peerFirstSeen.has(id))
@@ -968,7 +980,7 @@ function usePartyVoice() {
             for (const [id, firstSeen] of peerFirstSeen) {
                 const state = bridgePeerState(controlPeers.get(id), subscription, Date.now(), firstSeen);
                 for (const account of peerAccounts.get(id) ?? [])
-                    states[account] = { state };
+                    states[account] = { state, muted: peerMutes.get(id) };
             }
             if (active.current !== call)
                 return;
@@ -1000,7 +1012,8 @@ function usePartyVoice() {
     }
     async function poll(call, stream) {
         while (active.current === call) {
-            const { members, descriptions } = await voiceEvents(call.party);
+            const { members, descriptions, muted } = await voiceEvents(call.party);
+            call.memberMutes = muted;
             if (active.current !== call)
                 return;
             for (const [account, peer] of call.peers) {
@@ -1108,6 +1121,11 @@ function usePartyVoice() {
             await call.signaling;
             if (active.current !== call)
                 return;
+            try {
+                await setVoiceMute(call.party, !stream.getAudioTracks()[0].enabled);
+            } catch {
+                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+            }
             waitForVoice(call);
             await poll(call, stream);
         }
@@ -1286,6 +1304,15 @@ function PartyRowButton({ label, disabled, onClick, children }) {
         SP_REACT.createElement("svg", { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8,
             strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": true },
             SP_REACT.createElement("title", null, label), children));
+}
+function PartyCreateButtons({ disabled, create }) {
+    return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
+        SP_REACT.createElement(PartyRowButton, { label: "Create invite-only party", disabled, onClick: () => create(false) },
+            SP_REACT.createElement("rect", { x: 5, y: 10, width: 14, height: 11, rx: 2 }),
+            SP_REACT.createElement("path", { d: "M8 10V7a4 4 0 018 0v3m-4 5v2" })),
+        SP_REACT.createElement(PartyRowButton, { label: "Create friends-only party", disabled, onClick: () => create(true) },
+            SP_REACT.createElement("circle", { cx: 9, cy: 7, r: 3 }),
+            SP_REACT.createElement("path", { d: "M3 21v-3a6 6 0 0112 0v3m1-17a3 3 0 010 6m2 4a5 5 0 013 4v3" })));
 }
 function PartyMemberRow({ player, action }) {
     return SP_REACT.createElement("div", { className: `psn-social-party-member${player.self ? " psn-social-you" : ""}` },
@@ -1615,23 +1642,15 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                     return SP_REACT.createElement(PlayerRow, { key: chat.id, player: { id: chat.id, name, avatar: peer?.avatar ?? friend?.avatar, avatars: [...(peer?.avatars ?? []), ...(friend?.avatars ?? [])] }, detail: chat.unread ? `● ${preview}` : preview, disabled: busy, action: () => openChat(chat, name, session.me) });
                 }))),
             tab === "Parties" && SP_REACT.createElement(DFL.PanelSection, null,
-                SP_REACT.createElement(DFL.PanelSectionRow, null,
+                !parties?.length && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
                         SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, "Party"),
-                        !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) &&
-                            SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
-                                SP_REACT.createElement(PartyRowButton, { label: "Create invite-only party", disabled: busy || voice.stopping,
-                                    onClick: () => partyAction(() => api.createParty(false), "Party created.", true) },
-                                    SP_REACT.createElement("rect", { x: 5, y: 10, width: 14, height: 11, rx: 2 }),
-                                    SP_REACT.createElement("path", { d: "M8 10V7a4 4 0 018 0v3m-4 5v2" })),
-                                SP_REACT.createElement(PartyRowButton, { label: "Create friends-only party", disabled: busy || voice.stopping,
-                                    onClick: () => partyAction(() => api.createParty(true), "Party created.", true) },
-                                    SP_REACT.createElement("circle", { cx: 9, cy: 7, r: 3 }),
-                                    SP_REACT.createElement("path", { d: "M3 21v-3a6 6 0 0112 0v3m1-17a3 3 0 010 6m2 4a5 5 0 013 4v3" }))))),
+                        !voice.activeParty && SP_REACT.createElement(PartyCreateButtons, { disabled: busy || voice.stopping,
+                            create: friends => partyAction(() => api.createParty(friends), "Party created.", true) }))),
                 error && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement("div", { className: "psn-social-header-alert", role: "alert" }, error)),
                 parties?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No parties or invitations."),
-                parties?.map(party => {
+                parties?.map((party, partyIndex) => {
                     const member = party.members.some(player => player.id === session.me.id);
                     const joinButton = !member && SP_REACT.createElement(PartyRowButton, { label: party.invited ? "Accept invitation" : "Join party",
                         disabled: busy || voice.stopping || Boolean(voice.activeParty),
@@ -1664,7 +1683,11 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                                             await api.leave(party.id);
                                         }, "Party left.") },
                                         SP_REACT.createElement("path", { d: "M10 4H4v16h6m-1-8h12m-4-4 4 4-4 4" }))) :
-                                    !party.members.length && joinButton),
+                                    SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
+                                        partyIndex === 0 && !voice.activeParty && !parties.some(room => room.members.some(player => player.id === session.me.id)) &&
+                                            SP_REACT.createElement(PartyCreateButtons, { disabled: busy || voice.stopping,
+                                                create: friends => partyAction(() => api.createParty(friends), "Party created.", true) }),
+                                        !party.members.length && joinButton)),
                             party.members.map((player, index) => SP_REACT.createElement(PartyMemberRow, { key: player.id, action: index === 0 ? joinButton : undefined,
                                 player: partyMemberPresentation(player, [session.me, ...session.friends].find(friend => friend.id === player.id), {
                                     self: player.id === session.me.id, active: voice.activeParty === party.id,
