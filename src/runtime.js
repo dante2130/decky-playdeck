@@ -329,6 +329,7 @@ const bridgeVoicePeers = callable("bridge_voice_peers");
 const voiceEvents = callable("voice_events");
 const sendDescription = callable("send_voice_description");
 const stopVoice = callable("stop_voice");
+const setVoiceMute = callable("set_voice_mute");
 function closePeer(peer) {
     peer.connection.onconnectionstatechange = null;
     peer.connection.ontrack = null;
@@ -398,6 +399,7 @@ function usePartyVoice() {
     const [status, setStatus] = SP_REACT.useState();
     const [stopping, setStopping] = SP_REACT.useState(false);
     const [muted, setMuted] = SP_REACT.useState(false);
+    const [muteError, setMuteError] = SP_REACT.useState();
     const [bridgeStats, setBridgeStats] = SP_REACT.useState();
     async function stop(message) {
         const call = active.current;
@@ -1027,6 +1029,7 @@ function usePartyVoice() {
         }
         active.current = call;
         setMuted(false);
+        setMuteError(undefined);
         setBridgeStats(undefined);
         setStatus({ party, text: "Waiting for microphone access…" });
         call.timer = setTimeout(() => { void stop("Steam did not grant microphone access in time."); }, 15000);
@@ -1065,13 +1068,27 @@ function usePartyVoice() {
         }
     }
     function toggleMute() {
-        const track = active.current?.mic?.getAudioTracks()[0];
+        const call = active.current;
+        const track = call?.mic?.getAudioTracks()[0];
         if (!track)
             return;
-        track.enabled = !track.enabled;
-        setMuted(!track.enabled);
+        const nextMuted = track.enabled;
+        track.enabled = !nextMuted;
+        call.muted = nextMuted;
+        setMuted(nextMuted);
+        setMuteError(undefined);
+        call.muteUpdate = (call.muteUpdate ?? Promise.resolve()).then(async () => {
+            if (active.current === call)
+                await setVoiceMute(call.party, nextMuted);
+        }).then(() => {
+            if (active.current === call && call.muted === nextMuted)
+                setMuteError(undefined);
+        }).catch(() => {
+            if (active.current === call && call.muted === nextMuted)
+                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+        });
     }
-    return { start, stop, status, bridgeStats, activeParty: active.current?.party, stopping, muted, toggleMute };
+    return { start, stop, status, bridgeStats, activeParty: active.current?.party, stopping, muted, muteError, toggleMute };
 }
 
 const api = {
@@ -1151,6 +1168,7 @@ const rowStyles = `
   .psn-social-entry:is(:focus, :focus-visible, .gpfocus) { background: #353d36; outline: 2px solid #78cf45; outline-offset: -2px; }
   .psn-social-player { display: flex; gap: 7px; align-items: center; min-width: 0; width: 100%; text-align: left; }
   .psn-social-player-avatar { width: 36px; height: 36px; flex: 0 0 36px; display: grid; place-items: center; position: relative; border-radius: 50%; background: #414846; color: #fff; font-size: 16px; font-weight: 700; }
+  .psn-social-avatar-muted { position: absolute; right: -3px; bottom: -3px; z-index: 2; width: 19px; height: 19px; border-radius: 50%; background: #20252b; color: white; display: grid; place-items: center; }
   .psn-social-player-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
   .psn-social-player-copy { flex: 1; min-width: 0; line-height: 1.4; }
   .psn-social-player-copy > * { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1197,10 +1215,13 @@ function ProfileAvatar({ player, showPresence }) {
         void fetchFallback();
         return () => { active = false; };
     }, [avatar, primary, candidates]);
-    return SP_REACT.createElement("span", { className: showPresence ? "psn-social-player-avatar" : "psn-social-profile-avatar", "aria-hidden": "true" },
+    return SP_REACT.createElement("span", { className: showPresence ? "psn-social-player-avatar" : "psn-social-profile-avatar", "aria-hidden": player.muted ? undefined : "true" },
         Array.from(player.name)[0]?.toUpperCase(),
         avatar && SP_REACT.createElement("img", { key: avatar, src: avatar, alt: "", referrerPolicy: "no-referrer", onError: () => setFailedAvatars(previous => [...previous, avatar]) }),
         !avatar && fallbackImage && SP_REACT.createElement("img", { src: fallbackImage, alt: "", onError: event => { event.currentTarget.hidden = true; } }),
+        player.muted && SP_REACT.createElement("span", { className: "psn-social-avatar-muted", role: "img", "aria-label": "Microphone muted" },
+            SP_REACT.createElement("svg", { width: 15, height: 15, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, "aria-hidden": true },
+                SP_REACT.createElement("path", { d: "M3 3l18 18M9 9v3a3 3 0 005 2M15 9V5a3 3 0 00-6 0M5 10v2a7 7 0 0012 5M19 10v2M12 19v3M8 22h8" }))),
         showPresence && SP_REACT.createElement("span", { className: "psn-social-presence", style: { background: presenceTone(player) } }));
 }
 function PlayerRow({ player, detail, action, disabled }) {
@@ -1417,7 +1438,7 @@ function SocialPanel() {
         session && SP_REACT.createElement(SP_REACT.Fragment, null,
             SP_REACT.createElement("header", { className: "psn-social-header" },
                 SP_REACT.createElement("div", { className: "psn-social-profile" },
-                    SP_REACT.createElement(ProfileAvatar, { player: session.me }),
+                    SP_REACT.createElement(ProfileAvatar, { player: { ...session.me, muted: Boolean(voice.activeParty) && voice.muted } }),
                     SP_REACT.createElement("div", { className: "psn-social-profile-copy" },
                         SP_REACT.createElement("strong", null, session.me.name),
                         SP_REACT.createElement("div", { className: "psn-social-profile-meta" },
@@ -1483,7 +1504,7 @@ function SocialPanel() {
                     return SP_REACT.createElement(DFL.PanelSectionRow, { key: party.id },
                         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { display: "grid", gap: 4 } },
                             SP_REACT.createElement("strong", null, party.name || "PlayStation party"),
-                            party.members.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: { ...player, avatar: player.avatar ?? [session.me, ...session.friends].find(friend => friend.id === player.id)?.avatar } })),
+                            party.members.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: { ...player, muted: voice.activeParty === party.id && player.id === session.me.id && voice.muted, avatar: player.avatar ?? [session.me, ...session.friends].find(friend => friend.id === player.id)?.avatar } })),
                             member ? SP_REACT.createElement(SP_REACT.Fragment, null,
                                 SP_REACT.createElement("span", null, "Joined party session"),
                                 voice.status?.party === party.id && SP_REACT.createElement("span", { role: "status" }, voice.status.text),
@@ -1514,6 +1535,7 @@ function SocialPanel() {
                                     voice.bridgeStats.subscription === "no-reply" &&
                                         ` · No audio subscription reply · Bridge control messages received ${voice.bridgeStats.controlMessages}`,
                                     voice.bridgeStats.subscription === "peer-mismatch" && " · Bridge replied with different audio peers"),
+                                voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, voice.muteError),
                                 voice.activeParty === party.id ? SP_REACT.createElement(SP_REACT.Fragment, null,
                                     voice.status?.connected && SP_REACT.createElement(DFL.DialogButton, { onClick: voice.toggleMute }, voice.muted ? "Unmute microphone" : "Mute microphone"),
                                     SP_REACT.createElement(DFL.DialogButton, { onClick: () => void voice.stop() }, "Disconnect voice")) : SP_REACT.createElement(SP_REACT.Fragment, null,

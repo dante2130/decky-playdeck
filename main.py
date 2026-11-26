@@ -660,6 +660,26 @@ class Plugin:
                 voice["published"] = True
                 decky.logger.info("Sony accepted the Deck’s party bridge peer mapping.")
 
+    async def set_voice_mute(self, session, muted):
+        session = identifier(session)
+        if not isinstance(muted, bool):
+            raise ValueError("Microphone mute must be a boolean.")
+        async with self.voice_lock:
+            voice = self.bridge_voice or self.voice
+            if not voice or voice["session"] != session:
+                raise ValueError("The party voice session is no longer active.")
+            fields = json.loads(base64.b64decode(voice.get("member_data") or PARTY_MEMBER_DATA, validate=True))
+            if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+                raise ValueError("Sony returned an unsupported party member data layout.")
+            # PS App's microphone mute property is customData4 slot 5.
+            fields[5] = "1" if muted else "0"
+            member_data = base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+            if voice.get("published"):
+                fields[PARTY_BRIDGE_DATA_SLOT] = f'{voice["id"]}\n{voice["peer"]}'
+            data = base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+            await self._set_bridge_member_data(session, data)
+            voice["member_data"] = member_data
+
     async def _set_bridge_member_data(self, session, data):
         await self._api(f"{PARTIES}/partySessions/{session}/members/me", "PATCH",
                         {"customData4": data}, {"Content-Type": "application/json; charset=utf-8"})
