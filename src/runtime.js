@@ -1621,7 +1621,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                 !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement(DFL.DialogButton, { disabled: busy || voice.stopping, onClick: () => partyAction(() => api.createParty(false), "Party created.", true) }, "Create invite-only party")),
                 !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) && SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    SP_REACT.createElement(DFL.DialogButton, { disabled: busy || voice.stopping, onClick: () => partyAction(() => api.createParty(true), "Party created.", true) }, "Create friends-only party")),
+                    SP_REACT.createElement(DFL.DialogButton, { style: { marginTop: 6 }, disabled: busy || voice.stopping, onClick: () => partyAction(() => api.createParty(true), "Party created.", true) }, "Create friends-only party")),
                 parties?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No parties or invitations."),
                 parties?.map(party => {
                     const member = party.members.some(player => player.id === session.me.id);
