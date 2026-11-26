@@ -3,7 +3,7 @@ const { findInReactTree, getReactRoot } = DFL;
 const { createElement } = SP_REACT;
 const registryKey = "__necroSteamMenuV1";
 const entryPrefix = "necro-menu:";
-const registryRevision = 4;
+const registryRevision = 5;
 export const steamMenuPositions = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 function patchMountedMenu(registry) {
     const root = document.getElementById("root");
@@ -77,6 +77,10 @@ function patchMountedMenu(registry) {
                             onSecondaryActionDescription: entry.secondaryActionDescription ?? "Change Position",
                             onSecondaryButton: entry.onSecondary,
                         } : {}),
+                        ...(entry.onOptions ? {
+                            onOptionsActionDescription: entry.optionsActionDescription,
+                            onOptionsButton: entry.onOptions,
+                        } : {}),
                     }));
                     insertions.set(index, insertion);
                 }
@@ -114,14 +118,15 @@ function patchMountedMenu(registry) {
         rowsSeen.clear();
     };
 }
-export function installSteamMainMenuEntry(route, icon, getPosition, onSecondary) {
+export function installSteamMainMenuEntry(route, icon, getPosition, onSecondary, onOptions) {
     const host = window;
     const registry = host[registryKey] ?? (host[registryKey] = { entries: new Map() });
     const entry = {
         id: "playdeck", route, icon, order: 40,
-        label: "PlayDeck", onSecondary,
+        label: "PlayDeck", onSecondary, onOptions,
+        optionsActionDescription: "PlayDeck settings",
         get position() { return getPosition(); },
-        get secondaryActionDescription() { return "PlayDeck settings"; },
+        get secondaryActionDescription() { return "Change menu position"; },
     };
     registry.entries.set(entry.id, entry);
     const stopRetrying = () => {

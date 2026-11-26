@@ -1696,7 +1696,29 @@ var index = definePlugin(() => {
     routerHook.addRoute(partyRoute, () => routePanel({ initialTab: "Parties" }), { exact: true });
     routerHook.addRoute(menuRoute, () => routePanel({}), { exact: true });
     routerHook.addRoute(settingsRoute, () => routePanel({ settingsOnOpen: true }), { exact: true });
-    const removeMenu = installSteamMainMenuEntry(menuRoute, pluginIcon, () => 3, () => openRoute(settingsRoute));
+    let menuPosition = 3;
+    try {
+        const saved = Number(localStorage.getItem("PLAYDECK_MENU_POSITION") ?? 3);
+        if (Number.isInteger(saved) && saved >= 1 && saved <= 9)
+            menuPosition = saved;
+    } catch { /* Keep the default position if storage is unavailable. */ }
+    function chooseMenuPosition() {
+        const dropdown = new DFL.Dropdown({
+            rgOptions: Array.from({ length: 9 }, (_, index) => ({ data: index + 1, label: String(index + 1) })),
+            selectedOption: menuPosition,
+            onChange: ({ data }) => {
+                try {
+                    localStorage.setItem("PLAYDECK_MENU_POSITION", String(data));
+                    menuPosition = data;
+                } catch {
+                    api$1.toaster.toast({ title: "PlayDeck", body: "Could not save Steam menu position." });
+                }
+            },
+        });
+        dropdown.ShowMenu();
+    }
+    const removeMenu = installSteamMainMenuEntry(menuRoute, pluginIcon, () => menuPosition,
+        chooseMenuPosition, () => openRoute(settingsRoute));
     return {
         name: "PlayDeck",
         titleView: SP_REACT.createElement("div", { className: DFL.staticClasses.Title }, "PlayDeck"),
