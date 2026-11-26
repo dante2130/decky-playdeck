@@ -1,3 +1,4 @@
+import { attachPlayback } from "./attachment-playback.js";
 import { formatMessageDate, messageListPlayer, scrollConversationHistory, createConversationParty } from "./message-presentation.js";
 import { installPartyBadge } from "./party-badge.js";
 import { installSteamMainMenuEntry } from "./steam-main-menu.js";
@@ -1179,6 +1180,7 @@ const api = {
     inbox: callable("inbox"),
     createChat: callable("create_chat"),
     messages: callable("messages"),
+    attachment: callable("attachment_media"),
     send: callable("send_message"),
     parties: callable("parties"),
     createParty: callable("create_party"),
@@ -1362,6 +1364,70 @@ function Dialog({ closeModal, title, children }) {
             SP_REACT.createElement("h2", { style: { margin: 0 } }, title),
             children));
 }
+function AttachmentViewer({ chat, message, index, attachment, closeModal }) {
+    const [media, setMedia] = SP_REACT.useState();
+    const [error, setError] = SP_REACT.useState();
+    const [attempt, setAttempt] = SP_REACT.useState(0);
+    const player = SP_REACT.useRef(null);
+    SP_REACT.useEffect(() => {
+        let active = true;
+        setMedia(undefined);
+        setError(undefined);
+        api.attachment(chat.id, chat.thread, message.id, index).then(result => {
+            if (active) setMedia(result);
+        }).catch(problem => {
+            if (active) setError(problem instanceof Error ? problem.message : String(problem));
+        });
+        return () => { active = false; };
+    }, [chat.id, chat.thread, message.id, index, attempt]);
+    SP_REACT.useEffect(() => {
+        if (media && !error && player.current && ["video", "audio"].includes(media.kind))
+            return attachPlayback(player.current, media, setError);
+    }, [media, error]);
+    function togglePlayback() {
+        const element = player.current;
+        if (!element) return;
+        if (element.paused) void element.play().catch(() => setError("Playback could not start. Try opening the attachment in your browser."));
+        else element.pause();
+    }
+    function seek(event) {
+        const element = player.current;
+        const button = event.detail?.button;
+        if (!element || !Number.isFinite(element.duration) || ![11, 12].includes(button)) return;
+        element.currentTime = Math.max(0, Math.min(element.duration, element.currentTime + (button === 11 ? -10 : 10)));
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    return SP_REACT.createElement(WideModal, { closeModal, fullWidth: true },
+        SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { width: "100%", display: "flex", flexDirection: "column", gap: 12, maxHeight: "80vh", overflowY: "auto" } },
+            SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
+                SP_REACT.createElement("h2", { style: { margin: 0, overflowWrap: "anywhere" } }, attachment.label),
+                SP_REACT.createElement(ChatIcon, { label: "Close attachment", onClick: closeModal }, SP_REACT.createElement("path", { d: "m6 6 12 12M18 6 6 18" }))),
+            !media && !error && SP_REACT.createElement("div", { role: "status" }, "Loading attachment..."),
+            error && SP_REACT.createElement("div", { role: "alert" }, error),
+            media && !error && media.kind === "image" && SP_REACT.createElement("img", { src: media.url, alt: attachment.label, referrerPolicy: "no-referrer",
+                style: { width: "100%", maxWidth: "100%", height: "65vh", objectFit: "contain" },
+                onError: () => setError("This image could not be displayed. Retry to refresh its link.") }),
+            media && !error && ["video", "audio"].includes(media.kind) && SP_REACT.createElement(DFL.Focusable, {
+                focusableIfEmpty: true, role: "group", "aria-label": "Attachment playback", onOKActionDescription: "Play / pause",
+                onActivate: togglePlayback, onGamepadDirection: seek, actionDescriptionMap: { 11: "Rewind 10 seconds", 12: "Forward 10 seconds" },
+            }, SP_REACT.createElement(media.kind, { ref: player, poster: media.kind === "video" ? media.preview : undefined,
+                controls: true, playsInline: true, preload: "metadata", tabIndex: -1,
+                style: { width: "100%", maxHeight: "65vh" },
+                onError: () => setError("This media could not be played. Try opening it in your browser.") })),
+            error && SP_REACT.createElement(DFL.DialogButton, { onClick: () => setAttempt(value => value + 1) }, "Retry attachment"),
+            media?.downloadUrl?.startsWith("https://") && SP_REACT.createElement(DFL.DialogButton, {
+                onClick: () => window.SteamClient.System.OpenInSystemBrowser(media.downloadUrl),
+            }, media.kind === "file" ? "Open / download file" : "Open in browser")));
+}
+function MessageAttachments({ chat, message }) {
+    return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6, flexWrap: "wrap", marginTop: message.text ? 6 : 0 } },
+        message.attachments.map((attachment, index) => SP_REACT.createElement(DFL.DialogButton, {
+            key: index, onGamepadFocus: event => event.currentTarget?.scrollIntoView({ block: "nearest" }),
+            onClick: () => DFL.showModal(SP_REACT.createElement(AttachmentViewer, { chat, message, index, attachment })),
+        }, attachment.kind === "video" ? "Play video" : attachment.kind === "audio" ? "Play voice message" :
+            attachment.kind === "file" ? `Open ${attachment.label}` : `View ${attachment.label.toLowerCase()}`)));
+}
 function Conversation({ me, title, chat, closeModal, changed }) {
     const { run, busy, error } = useTask();
     const voice = useSharedPartyVoice();
@@ -1384,6 +1450,16 @@ function Conversation({ me, title, chat, closeModal, changed }) {
     const [draft, setDraft] = SP_REACT.useState("");
     const history = SP_REACT.useRef(null);
     const groupChat = chat.members.filter(member => member.id !== me).length > 1;
+    function pageHistory(event) {
+        const button = event.detail?.button;
+        if (button !== 5 && button !== 6) return;
+        scrollConversationHistory(history.current, {
+            detail: { button: button === 5 ? 9 : 10 },
+            preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation(),
+        });
+        event.preventDefault();
+        event.stopPropagation();
+    }
     async function refresh() {
         setMessages(await api.messages(chat.id, chat.thread));
     }
@@ -1393,7 +1469,7 @@ function Conversation({ me, title, chat, closeModal, changed }) {
             history.current.scrollTop = history.current.scrollHeight;
     }, [messages]);
     return SP_REACT.createElement(WideModal, { closeModal: closeModal, fullWidth: true },
-        SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { width: "100%", minWidth: 0, boxSizing: "border-box", height: "min(510px, 70vh)", display: "flex", flexDirection: "column", gap: 8 } },
+        SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", onButtonDown: pageHistory, actionDescriptionMap: { 5: "Older messages", 6: "Newer messages" }, style: { width: "100%", minWidth: 0, boxSizing: "border-box", height: "min(510px, 70vh)", display: "flex", flexDirection: "column", gap: 8 } },
             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
                 SP_REACT.createElement("h2", { style: { margin: 0 } }, title),
                 SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
@@ -1428,7 +1504,8 @@ function Conversation({ me, title, chat, closeModal, changed }) {
                                     background: mine ? "#286c36" : "#353b42",
                                     borderRadius: mine ? "13px 13px 3px 13px" : "13px 13px 13px 3px",
                                     overflowWrap: "anywhere", whiteSpace: "pre-wrap",
-                                } }, item.text ?? "Attachment or system message"),
+                                } }, item.text ?? (!item.attachments?.length ? "Attachment or system message" : null),
+                                Boolean(item.attachments?.length) && SP_REACT.createElement(MessageAttachments, { chat, message: item })),
                             date && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, date)),
                         mine && avatar);
                 })),
@@ -1690,7 +1767,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                 inbox?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No conversations."),
                 SP_REACT.createElement("div", { className: "psn-social-list psn-social-group" }, inbox?.map(chat => {
                     const name = title(chat, session.me);
-                    const preview = chat.latest?.text ?? (chat.latest ? "Attachment or system message" : "No messages");
+                    const preview = chat.latest?.text ?? chat.latest?.attachments?.[0]?.label ?? (chat.latest ? "Attachment or system message" : "No messages");
                     return SP_REACT.createElement(PlayerRow, { key: chat.id, player: messageListPlayer(chat, session.me.id, session.friends, name), detail: chat.unread ? `● ${preview}` : preview, disabled: busy, action: () => openChat(chat, name, session.me) });
                 }))),
             tab === "Parties" && SP_REACT.createElement(DFL.PanelSection, null,

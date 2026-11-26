@@ -32,6 +32,8 @@ export function messageListPlayer(chat, me, friends, name) {
 export function scrollConversationHistory(element, event) {
     if (!element)
         return false;
+    if (event.target && event.target !== element && element.contains?.(event.target))
+        return false;
     const button = event.detail?.button ?? ({ ArrowUp: 9, ArrowDown: 10 })[event.key];
     if (button !== 9 && button !== 10)
         return false;

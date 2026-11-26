@@ -200,6 +200,42 @@ def player(row):
     }
 
 
+def attachment_url(value):
+    if not isinstance(value, str) or len(value) > 16384:
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        trusted = any(host.endswith(suffix) for suffix in (".playstation.net", ".playstation.com", ".cloudfront.net"))
+        if not trusted or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return None
+        if parsed.scheme == "http" and host.endswith(".playstation.net"):
+            value = "https://" + value[7:]
+        elif parsed.scheme != "https":
+            return None
+        return value
+    except ValueError:
+        return None
+
+
+def message_attachments(row):
+    detail = row.get("messageDetail") or {}
+    if not isinstance(detail, dict):
+        return []
+    attachments = []
+    for key, kind, label in (("imageMessageDetail", "image", "Image"),
+                             ("videoMessageDetail", "video", "Video"),
+                             ("audioMessageDetail", "audio", "Voice message"),
+                             ("stickerMessageDetail", "image", "Sticker"),
+                             ("fileMessageDetail", "file", "File")):
+        item = detail.get(key)
+        if isinstance(item, dict):
+            attachments.append({"kind": kind, "label": str(item.get("fileName") or label)[:160],
+                                "ugcId": item.get("ugcId"), "resourceId": item.get("resourceId"),
+                                "url": attachment_url(item.get("imageUrl") or item.get("downloadUrl") or item.get("url"))})
+    return attachments
+
+
 def message(row):
     detail = row.get("messageDetail") or {}
     body = row.get("body") or detail.get("body")
@@ -210,6 +246,7 @@ def message(row):
         "sender": str(sender.get("accountId", "")),
         "name": sender.get("onlineId"),
         "date": row.get("createdTimestamp"),
+        "attachments": [{"kind": item["kind"], "label": item["label"]} for item in message_attachments(row)],
     }
 
 
@@ -498,6 +535,72 @@ class Plugin:
                          "name": profile.get("name") or item["name"]})
             messages.append(item)
         return sorted(messages, key=lambda row: row["date"] or "")
+
+    async def attachment_media(self, group, thread, message_id, index=0):
+        group, thread = conversation_identifier(group), conversation_identifier(thread)
+        if not isinstance(message_id, str) or not re.fullmatch(r"[A-Za-z0-9_.~#-]{1,128}", message_id):
+            raise ValueError("Invalid message identifier.")
+        if type(index) is not int or index < 0 or index > 15:
+            raise ValueError("Invalid attachment index.")
+        path = f"{GROUPS}/members/me/groups/{group}/threads/{thread}/messages"
+        rows = (await self._api(path)).get("messages", [])
+        row = next((item for item in rows if str(item.get("messageUid")) == message_id), None)
+        attachments = message_attachments(row) if row else []
+        if index >= len(attachments):
+            raise ValueError("Attachment is no longer available. Refresh the conversation.")
+        item = attachments[index]
+        if item["url"]:
+            return {"kind": item["kind"], "label": item["label"], "url": item["url"], "downloadUrl": item["url"]}
+        error = None
+        if item["resourceId"] and item["kind"] in ("image", "audio"):
+            try:
+                return await self._attachment_resource(group, item)
+            except (ValueError, OSError) as problem:
+                error = problem
+        if item["ugcId"]:
+            try:
+                query = urlencode({"ugcIds": identifier(item["ugcId"])})
+                result = await self._api(f"{MOBILE}/gameMediaService/v2/c2s/content?{query}")
+                documents = result.get("ugcDocument") or []
+                if not isinstance(documents, list) or not documents or not isinstance(documents[0], dict) or not documents[0].get("id"):
+                    raise ValueError("Sony no longer provides this attachment.")
+                document = documents[0]
+                urls = await self._api(f'{MOBILE}/gameMediaService/v2/c2s/ugc/{identifier(document["id"])}/url')
+                keys = ("videoUrl", "downloadUrl") if item["kind"] == "video" else ("screenshotUrl", "downloadUrl")
+                url = next((attachment_url(urls.get(key)) for key in keys if attachment_url(urls.get(key))), None)
+                if not url:
+                    raise ValueError("Sony did not provide a supported attachment link.")
+                return {"kind": item["kind"], "label": item["label"], "url": url,
+                        "preview": attachment_url(urls.get("largePreviewImage")), "downloadUrl": url,
+                        "stream": "hls" if urlsplit(url).path.lower().endswith(".m3u8") else "file"}
+            except (ValueError, OSError) as problem:
+                error = problem
+        raise ValueError("This attachment has expired or could not be loaded.") from error
+
+    async def _attachment_resource(self, group, item):
+        url = f'{GROUPS}/groups/{group}/resources/{conversation_identifier(item["resourceId"])}'
+        def fetch(token):
+            opener = build_opener(NoRedirect(), HTTPSHandler(context=tls_context()))
+            try:
+                with opener.open(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=20) as reply:
+                    content_type = reply.headers.get_content_type()
+                    allowed = {"image/jpeg", "image/png", "image/webp", "image/gif", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/aac", "audio/wav", "audio/webm"}
+                    if content_type not in allowed or not content_type.startswith(item["kind"] + "/"):
+                        raise ValueError("Sony returned an unsupported attachment format.")
+                    data = reply.read(8 * 1024 * 1024 + 1)
+                    if not data or len(data) > 8 * 1024 * 1024:
+                        raise ValueError("Attachment is empty or too large for inline viewing.")
+                    return "data:" + content_type + ";base64," + base64.b64encode(data).decode()
+            except HTTPError as problem:
+                raise PsnError(problem.code) from None
+        token = await self._access()
+        try:
+            data = await asyncio.to_thread(fetch, token)
+        except PsnError as problem:
+            if problem.status != 401:
+                raise ValueError("This attachment is no longer available.") from None
+            data = await asyncio.to_thread(fetch, await self._access(rejected=token))
+        return {"kind": item["kind"], "label": item["label"], "url": data}
 
     async def send_message(self, group, thread, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 256:

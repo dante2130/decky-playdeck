@@ -5,7 +5,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 root = Path(__file__).resolve().parent
 files = ("plugin.json", "package.json", "main.py", "voice_push.py", "psn-push-intermediate.pem",
-         "LICENSE", "README.md", "dist/index.js", "dist/party-voice-native")
+         "LICENSE", "third_party/hls.js-LICENSE.txt", "README.md", "dist/index.js", "dist/party-voice-native")
 if any(not (root / name).is_file() for name in files):
     raise SystemExit("Build the frontend and native relay before packaging.")
 modules = root / "py_modules"

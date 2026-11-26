@@ -76,3 +76,12 @@ test('group list avatars include other participants and keep individual profile 
     assert.deepEqual(result.avatarPlayers.map(player => player.avatar), ['a-photo', 'b-photo']);
     assert.equal(result.hidePresence, true);
 });
+
+test('history does not consume directions from attachment buttons', async () => {
+    const { scrollConversationHistory } = await import('../src/message-presentation.js');
+    const target = {};
+    const element = { scrollTop: 100, scrollHeight: 1000, clientHeight: 200, contains: value => value === target };
+    const event = { target, detail: { button: 10 }, preventDefault() { assert.fail('must allow attachment navigation'); }, stopPropagation() { assert.fail('must bubble'); } };
+    assert.equal(scrollConversationHistory(element, event), false);
+    assert.equal(element.scrollTop, 100);
+});
