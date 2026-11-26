@@ -1885,14 +1885,11 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                             voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, voice.muteError)));
                 }))));
 }
-const pluginIcon = SP_REACT.createElement("svg", { width: "1em", height: "1em", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
-        SP_REACT.createElement("rect", { x: "1", y: "5", width: "22", height: "14", rx: "4" }),
-        SP_REACT.createElement("rect", { x: "8", y: "8", width: "8", height: "8", rx: "1" }),
-        SP_REACT.createElement("path", { d: "M3.5 10h2.5m-1.25-1.25v2.5" }),
-        SP_REACT.createElement("rect", { x: "3.5", y: "13.5", width: "2.5", height: "2.5", rx: ".5" }),
-        SP_REACT.createElement("path", { d: "m19.5 8 1.35 2.4h-2.7L19.5 8Z", strokeWidth: "1" }),
-        SP_REACT.createElement("circle", { cx: "20.5", cy: "13", r: "1", strokeWidth: "1" }),
-        SP_REACT.createElement("path", { d: "m18.15 15.05 1.7 1.7m0-1.7-1.7 1.7", strokeWidth: "1" }));
+const pluginIcon = SP_REACT.createElement("svg", { width: "1em", height: "1em", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.6", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
+    SP_REACT.createElement("path", { d: "M6 2 10 10H2L6 2Z" }),
+    SP_REACT.createElement("circle", { cx: 18, cy: 6, r: 4 }),
+    SP_REACT.createElement("path", { d: "m2 14 8 8m0-8-8 8" }),
+    SP_REACT.createElement("rect", { x: 14, y: 14, width: 8, height: 8, rx: 0.4 }));
 var index = definePlugin(() => {
     const routerHook = api$1.routerHook;
     const partyRoute = "/playdeck/party";
