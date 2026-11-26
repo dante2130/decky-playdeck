@@ -2,7 +2,7 @@
 
 A separate Decky Loader plugin for PlayStation Network. It provides a friends list with presence and game activity when PSN supplies them, Online ID search, incoming friend requests and blocked-player lists, and text conversations. The Parties tab lists parties and invitations and provides controls to create, join, invite friends, and leave.
 
-Native party audio, attachment playback, and changes to friend requests or blocked players are currently unavailable. Use PlayStation App for voice.
+Native party voice uses Sony’s voice bridge. Connect with **Connect voice (Auto)** in the Parties tab.
 
 ## Install and sign in
 
@@ -10,7 +10,7 @@ Native party audio, attachment playback, and changes to friend requests or block
 2. Sign in on [PlayStation's website](https://www.playstation.com/) in a browser. In the same browser, visit [Sony's NPSSO endpoint](https://ca.account.sony.com/api/v1/ssocookie).
 3. Copy the `npsso` value into **Sony NPSSO code** in the plugin and select **Connect PlayStation Network**. Treat the code like a password. The plugin sends it to Sony during sign-in and stores only the resulting session tokens in its Decky settings directory, in an owner-only file. **Disconnect PlayStation Network** removes the local session.
 
-This plugin uses undocumented PSN endpoints. The Decky build and backend behavior with mocked PSN responses have been checked. Authenticated PSN behavior has yet to be confirmed on hardware.
+This plugin uses undocumented PSN endpoints. The build and native relay tests pass. Party voice was verified between PlayDeck on SteamOS and PlayStation App on Android, including audio from the Deck microphone on the Android device.
 
 ## Build
 
@@ -20,7 +20,10 @@ From this directory:
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm build
+python3 native/party-voice/build.py --test
+python3 native/party-voice/build.py
+python3 -m pip install --target py_modules -r requirements-build.txt
 python3 package_plugin.py
 ```
 
-The backend uses the Python standard library. Endpoint references include [psn-api](https://github.com/achievements-app/psn-api), [express-psn-api](https://github.com/Tazhys/express-psn-api), and [PlayStation Party](https://github.com/speedsorcererdev/PlayStation-Party).
+The frontend entry is the readable runtime recovered from the installed plugin because the original voice TypeScript was unavailable. The native relay requires Go 1.24 or later. The package includes the pinned Python voice dependencies. Endpoint references include [psn-api](https://github.com/achievements-app/psn-api), [express-psn-api](https://github.com/Tazhys/express-psn-api), and [PlayStation Party](https://github.com/speedsorcererdev/PlayStation-Party).
