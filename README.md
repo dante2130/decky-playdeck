@@ -2,15 +2,23 @@
 
 A separate Decky Loader plugin for PlayStation Network. It provides a friends list with presence and game activity when PSN supplies them, Online ID search, incoming friend requests and blocked-player lists, and text conversations. The Parties tab lists parties and invitations and provides controls to create, join, invite friends, and leave.
 
-Native party voice uses Sony’s voice bridge. Connect with **Connect voice (Auto)** in the Parties tab.
+Native party voice uses Sony’s voice bridge. Joining connects voice automatically; the headset icon reconnects it. Choose Auto or Direct in the gear settings.
 
 ## Install and sign in
 
 1. Enable Developer Mode in Decky, then select **Install Plugin from ZIP File** and choose `PlayDeck.zip`.
 2. Sign in on [PlayStation's website](https://www.playstation.com/) in a browser. In the same browser, visit [Sony's NPSSO endpoint](https://ca.account.sony.com/api/v1/ssocookie).
-3. Copy the `npsso` value into **Sony NPSSO code** in the plugin and select **Connect PlayStation Network**. Treat the code like a password. The plugin sends it to Sony during sign-in and stores only the resulting session tokens in its Decky settings directory, in an owner-only file. **Disconnect PlayStation Network** removes the local session.
+3. Open the gear settings and copy the `npsso` value into **Sony NPSSO code** and select **Connect PlayStation Network**. Treat the code like a password. The plugin sends it to Sony during sign-in and stores only the resulting session tokens in its Decky settings directory, in an owner-only file. **Disconnect PlayStation Network** removes the local session.
 
 This plugin uses undocumented PSN endpoints. The build and native relay tests pass. Party voice was verified between PlayDeck on SteamOS and PlayStation App on Android, including audio from the Deck microphone on the Android device.
+
+The Steam left-menu entry opens PlayDeck in a dialog over the current Steam screen. Close the dialog to return to that screen.
+
+## Message attachments
+
+Stickers display directly in the conversation. Images and videos show clickable previews that open the attachment viewer. Previews load as you scroll; videos do not play automatically. Use LB/RB to scroll message history while focusing attachment buttons. The viewer fills the available width. Videos support playback controls; on a controller, A plays or pauses, left/right seek 10 seconds, and B closes the viewer. File links are available when Sony supplies them. Deleted or expired media displays an error with a retry option.
+
+Images can load through the authenticated message-resource endpoint. Streaming video uses bundled [HLS.js](https://github.com/video-dev/hls.js); its license is included in `third_party/hls.js-LICENSE.txt`. The Sony media endpoint sequence was checked against [psn-php’s Media implementation](https://github.com/Tustin/psn-php/blob/master/src/Model/Media.php).
 
 ## Build
 

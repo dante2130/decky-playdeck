@@ -117,6 +117,13 @@ def identifier(value):
     return value
 
 
+def conversation_identifier(value):
+    # Direct-message group/thread IDs use dots and tildes; all are URL-unreserved characters.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.~-]{1,128}", value) or value in (".", ".."):
+        raise ValueError("Invalid PlayStation conversation identifier.")
+    return value
+
+
 def avatar_urls(row):
     personal = row.get("personalDetail") or {}
     candidates = [row.get("profilePicUrl")]
@@ -139,6 +146,40 @@ def avatar_urls(row):
     return urls
 
 
+def member_mute(row):
+    try:
+        fields = json.loads(base64.b64decode(row.get("customData4") or "", validate=True))
+        if isinstance(fields, list) and len(fields) > 5 and fields[5] in ("0", "1"):
+            return fields[5] == "1"
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def bridge_member_accounts(members, bridge_id):
+    accounts = {}
+    for member in members:
+        try:
+            fields = json.loads(base64.b64decode(member.get("customData4") or "", validate=True))
+            if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+                continue
+            bridge, peer = fields[PARTY_BRIDGE_DATA_SLOT].split("\n")
+            if bridge == bridge_id and member.get("accountId"):
+                accounts[identifier(peer)] = str(member["accountId"])
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return accounts
+
+
+def voice_member_data(row):
+    fields = json.loads(base64.b64decode(row.get("customData4") or PARTY_MEMBER_DATA, validate=True))
+    if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+        raise ValueError("Sony returned an unsupported party member data layout.")
+    fields[5] = "0"
+    fields[PARTY_BRIDGE_DATA_SLOT] = ""
+    return base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+
+
 def player(row):
     presence = (row.get("presences") or [{}])[0]
     avatars = avatar_urls(row)
@@ -154,20 +195,63 @@ def player(row):
         "status": row.get("primaryOnlineStatus") or presence.get("onlineStatus"),
         "game": presence.get("titleName") or presence.get("npTitleName"),
         "platform": presence.get("platform"),
+        "muted": member_mute(row),
         "level": (row.get("trophySummary") or {}).get("level"),
     }
+
+
+def attachment_url(value):
+    if not isinstance(value, str) or len(value) > 16384:
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        trusted = any(host.endswith(suffix) for suffix in (".playstation.net", ".playstation.com", ".cloudfront.net"))
+        if not trusted or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return None
+        if parsed.scheme == "http" and host.endswith(".playstation.net"):
+            value = "https://" + value[7:]
+        elif parsed.scheme != "https":
+            return None
+        return value
+    except ValueError:
+        return None
+
+
+def message_attachments(row):
+    detail = row.get("messageDetail") or {}
+    if not isinstance(detail, dict):
+        return []
+    attachments = []
+    for key, kind, label in (("imageMessageDetail", "image", "Image"),
+                             ("videoMessageDetail", "video", "Video"),
+                             ("audioMessageDetail", "audio", "Voice message"),
+                             ("stickerMessageDetail", "image", "Sticker"),
+                             ("fileMessageDetail", "file", "File")):
+        item = detail.get(key)
+        if isinstance(item, dict):
+            attachments.append({"kind": kind, "label": str(item.get("fileName") or label)[:160],
+                                "inline": key == "stickerMessageDetail",
+                                "ugcId": item.get("ugcId"), "resourceId": item.get("resourceId"),
+                                "url": attachment_url(item.get("imageUrl") or item.get("downloadUrl") or item.get("url"))})
+    return attachments
 
 
 def message(row):
     detail = row.get("messageDetail") or {}
     body = row.get("body") or detail.get("body")
     sender = row.get("sender") or {}
+    attachments = message_attachments(row)
+    if attachments and all(item["inline"] for item in attachments):
+        body = None
     return {
         "id": str(row.get("messageUid", "")),
         "text": body if isinstance(body, str) else None,
         "sender": str(sender.get("accountId", "")),
         "name": sender.get("onlineId"),
         "date": row.get("createdTimestamp"),
+        "attachments": [{"kind": item["kind"], "label": item["label"], "inline": item["inline"],
+                         "preview": item["url"] if item["inline"] else None} for item in attachments],
     }
 
 
@@ -385,6 +469,29 @@ class Plugin:
             profiles.update({str(row["accountId"]): player(row) for row in result.get("profiles", [])})
         return [profiles.get(account) or {"id": account, "name": account} for account in dict.fromkeys(accounts)]
 
+    async def _update_profiles(self, players):
+        participants = {person["id"]: person for person in players}
+        missing = [account for account, member in participants.items() if not member.get("avatar")]
+        for offset in range(0, len(missing), 100):
+            batch = missing[offset:offset + 100]
+            query = urlencode({"accountIds": ",".join(batch)})
+            try:
+                response = await self._api(f"{USERS}/profiles?{query}")
+            except (ValueError, OSError):
+                continue
+            profiles = response.get("profiles", [])
+            names = {participants[account]["name"].casefold(): account for account in batch}
+            for index, row in enumerate(profiles):
+                if not isinstance(row, dict) or not row.get("onlineId"):
+                    continue
+                # This endpoint omits accountId; match Online IDs first, then its ordered response.
+                account = str(row.get("accountId") or names.get(row["onlineId"].casefold()) or
+                              (batch[index] if len(profiles) == len(batch) else ""))
+                if account in participants:
+                    profile = player({**row, "accountId": account})
+                    participants[account].update({key: value for key, value in profile.items()
+                                                   if value is not None and value != []})
+
     async def inbox(self):
         async def groups(favorite):
             query = urlencode(dict(favoriteFilter=favorite, includeFields=GROUP_FIELDS, limit=200))
@@ -400,6 +507,16 @@ class Plugin:
                 "unread": bool(thread.get("existsUnreadMessage")),
                 "latest": message(thread["latestMessage"]) if thread.get("latestMessage") else None,
             }
+        participants = {}
+        for chat in threads.values():
+            for member in chat["members"]:
+                existing = participants.get(member["id"])
+                if existing is None or (not existing.get("avatar") and member.get("avatar")):
+                    participants[member["id"]] = member
+        await self._update_profiles(list(participants.values()))
+        await self._update_presences(list(participants.values()))
+        for chat in threads.values():
+            chat["members"] = [participants[member["id"]] for member in chat["members"]]
         return sorted(threads.values(), key=lambda item: (item["latest"] or {}).get("date") or "", reverse=True)
 
     async def create_chat(self, account):
@@ -407,14 +524,94 @@ class Plugin:
         return {"id": result["groupId"], "thread": (result.get("mainThread") or {}).get("threadId") or result["groupId"]}
 
     async def messages(self, group, thread):
-        path = f"{GROUPS}/members/me/groups/{identifier(group)}/threads/{identifier(thread)}/messages"
+        path = f"{GROUPS}/members/me/groups/{conversation_identifier(group)}/threads/{conversation_identifier(thread)}/messages"
         result = await self._api(path)
-        return sorted((message(row) for row in result["messages"]), key=lambda row: row["date"] or "")
+        people = {}
+        for row in result["messages"]:
+            sender = row.get("sender") or {}
+            if sender.get("accountId"):
+                people[str(sender["accountId"])] = player(sender)
+        await self._update_profiles(list(people.values()))
+        messages = []
+        for row in result["messages"]:
+            item = message(row)
+            profile = people.get(item["sender"], {})
+            item.update({"avatar": profile.get("avatar"), "avatars": profile.get("avatars", []),
+                         "name": profile.get("name") or item["name"]})
+            messages.append(item)
+        return sorted(messages, key=lambda row: row["date"] or "")
+
+    async def attachment_media(self, group, thread, message_id, index=0):
+        group, thread = conversation_identifier(group), conversation_identifier(thread)
+        if not isinstance(message_id, str) or not re.fullmatch(r"[A-Za-z0-9_.~#-]{1,128}", message_id):
+            raise ValueError("Invalid message identifier.")
+        if type(index) is not int or index < 0 or index > 15:
+            raise ValueError("Invalid attachment index.")
+        path = f"{GROUPS}/members/me/groups/{group}/threads/{thread}/messages"
+        rows = (await self._api(path)).get("messages", [])
+        row = next((item for item in rows if str(item.get("messageUid")) == message_id), None)
+        attachments = message_attachments(row) if row else []
+        if index >= len(attachments):
+            raise ValueError("Attachment is no longer available. Refresh the conversation.")
+        item = attachments[index]
+        if item["url"]:
+            return {"kind": item["kind"], "label": item["label"], "url": item["url"], "downloadUrl": item["url"]}
+        error = None
+        if item["resourceId"] and item["kind"] in ("image", "audio"):
+            try:
+                return await self._attachment_resource(group, item)
+            except (ValueError, OSError) as problem:
+                error = problem
+        if item["ugcId"]:
+            try:
+                query = urlencode({"ugcIds": identifier(item["ugcId"])})
+                result = await self._api(f"{MOBILE}/gameMediaService/v2/c2s/content?{query}")
+                documents = result.get("ugcDocument") or []
+                if not isinstance(documents, list) or not documents or not isinstance(documents[0], dict) or not documents[0].get("id"):
+                    raise ValueError("Sony no longer provides this attachment.")
+                document = documents[0]
+                urls = await self._api(f'{MOBILE}/gameMediaService/v2/c2s/ugc/{identifier(document["id"])}/url')
+                keys = ("videoUrl", "downloadUrl") if item["kind"] == "video" else ("screenshotUrl", "downloadUrl")
+                url = next((attachment_url(urls.get(key)) for key in keys if attachment_url(urls.get(key))), None)
+                if not url:
+                    raise ValueError("Sony did not provide a supported attachment link.")
+                return {"kind": item["kind"], "label": item["label"], "url": url,
+                        "preview": attachment_url(urls.get("largePreviewImage")),
+                        "thumbnail": attachment_url(urls.get("smallPreviewImage")) or attachment_url(urls.get("largePreviewImage")), "downloadUrl": url,
+                        "stream": "hls" if urlsplit(url).path.lower().endswith(".m3u8") else "file"}
+            except (ValueError, OSError) as problem:
+                error = problem
+        raise ValueError("This attachment has expired or could not be loaded.") from error
+
+    async def _attachment_resource(self, group, item):
+        url = f'{GROUPS}/groups/{group}/resources/{conversation_identifier(item["resourceId"])}'
+        def fetch(token):
+            opener = build_opener(NoRedirect(), HTTPSHandler(context=tls_context()))
+            try:
+                with opener.open(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=20) as reply:
+                    content_type = reply.headers.get_content_type()
+                    allowed = {"image/jpeg", "image/png", "image/webp", "image/gif", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/aac", "audio/wav", "audio/webm"}
+                    if content_type not in allowed or not content_type.startswith(item["kind"] + "/"):
+                        raise ValueError("Sony returned an unsupported attachment format.")
+                    data = reply.read(8 * 1024 * 1024 + 1)
+                    if not data or len(data) > 8 * 1024 * 1024:
+                        raise ValueError("Attachment is empty or too large for inline viewing.")
+                    return "data:" + content_type + ";base64," + base64.b64encode(data).decode()
+            except HTTPError as problem:
+                raise PsnError(problem.code) from None
+        token = await self._access()
+        try:
+            data = await asyncio.to_thread(fetch, token)
+        except PsnError as problem:
+            if problem.status != 401:
+                raise ValueError("This attachment is no longer available.") from None
+            data = await asyncio.to_thread(fetch, await self._access(rejected=token))
+        return {"kind": item["kind"], "label": item["label"], "url": data}
 
     async def send_message(self, group, thread, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 256:
             raise ValueError("Enter a message of up to 256 characters.")
-        await self._api(f"{GROUPS}/groups/{identifier(group)}/threads/{identifier(thread)}/messages",
+        await self._api(f"{GROUPS}/groups/{conversation_identifier(group)}/threads/{conversation_identifier(thread)}/messages",
                         "POST", {"messageType": 1, "body": text.strip()})
 
     async def parties(self):
@@ -436,6 +633,25 @@ class Plugin:
         } for row in result.get("parties", []) if row.get("sessionId")}
         for session_id in ids:
             parties.setdefault(session_id, {"id": session_id, "name": None, "members": [], "invited": True})
+        if parties:
+            try:
+                details = await self._api(f"{PARTIES}/partySessions?view=v3", headers={
+                    "X-PSN-SESSION-MANAGER-SESSION-IDS": ",".join(parties)})
+                for room in details.get("v2PartySessions", []):
+                    party = parties.get(room.get("sessionId"))
+                    if party:
+                        known = {member["id"]: member for member in party["members"]}
+                        members = []
+                        for row in room.get("members", []):
+                            if row.get("accountId"):
+                                member = known.get(str(row["accountId"])) or player(row)
+                                member["muted"] = member_mute(row)
+                                members.append(member)
+                        party["members"] = members
+            except (ValueError, OSError):
+                # Browsing parties remains available if full member data is restricted.
+                pass
+        await self._update_presences([member for party in parties.values() for member in party["members"]])
         return list(parties.values())
 
     def _party_member(self):
@@ -572,7 +788,7 @@ class Plugin:
                      "peer": None, "clock_rate": 16000, "unlinked": not bridges, "published": False,
                      "identity": base64.b64encode(f"{session}\n{signaling_id}\n".encode()).decode(),
                      "account": account,
-                     "member_data": member.get("customData4") or PARTY_MEMBER_DATA}
+                     "member_data": voice_member_data(member)}
             self.bridge_voice = voice
             stage = "link the voice bridge to the party"
             try:
@@ -659,6 +875,26 @@ class Plugin:
                 await self._set_bridge_member_data(session, data)
                 voice["published"] = True
                 decky.logger.info("Sony accepted the Deck’s party bridge peer mapping.")
+
+    async def set_voice_mute(self, session, muted):
+        session = identifier(session)
+        if not isinstance(muted, bool):
+            raise ValueError("Microphone mute must be a boolean.")
+        async with self.voice_lock:
+            voice = self.bridge_voice or self.voice
+            if not voice or voice["session"] != session:
+                raise ValueError("The party voice session is no longer active.")
+            fields = json.loads(base64.b64decode(voice.get("member_data") or PARTY_MEMBER_DATA, validate=True))
+            if not isinstance(fields, list) or len(fields) <= PARTY_BRIDGE_DATA_SLOT:
+                raise ValueError("Sony returned an unsupported party member data layout.")
+            # PS App's microphone mute property is customData4 slot 5.
+            fields[5] = "1" if muted else "0"
+            member_data = base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+            if voice.get("published"):
+                fields[PARTY_BRIDGE_DATA_SLOT] = f'{voice["id"]}\n{voice["peer"]}'
+            data = base64.b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode()
+            await self._set_bridge_member_data(session, data)
+            voice["member_data"] = member_data
 
     async def _set_bridge_member_data(self, session, data):
         await self._api(f"{PARTIES}/partySessions/{session}/members/me", "PATCH",
@@ -748,14 +984,21 @@ class Plugin:
             ids = sorted({identifier(peer["peerId"]) for peer in peers
                           if peer.get("peerId") and peer["peerId"] != voice["peer"]})
             identities = {}
+            accounts = {}
+            muted = {}
             if ids:
                 try:
                     party = await self._refresh_voice_members(voice)
-                    identities = bridge_member_peers(party.get("members", []), session, voice["id"])
+                    members = party.get("members", [])
+                    identities = bridge_member_peers(members, session, voice["id"])
+                    muted = {str(member.get("accountId")): member_mute(member) for member in members}
+                    accounts = bridge_member_accounts(members, voice["id"])
                 except (ValueError, OSError):
                     # Bridge media remains usable while the party member view is unavailable.
                     pass
-            return [{"id": peer, "identity": identities.get(peer)} for peer in ids]
+            return [{"id": peer, "identity": identities.get(peer),
+                     "account": accounts.get(peer),
+                     "muted": muted.get(accounts.get(peer))} for peer in ids]
 
     async def _stop_native_bridge(self, voice):
         process = voice.pop("native", None)
@@ -790,7 +1033,7 @@ class Plugin:
         session = voice["session"]
         unavailable = "This party is no longer available. Refresh Parties and join a current party."
         try:
-            response = await self._api(f"{PARTIES}/partySessions",
+            response = await self._api(f"{PARTIES}/partySessions?view=v3",
                                        headers={"X-PSN-SESSION-MANAGER-SESSION-IDS": session})
         except PsnError as error:
             if error.status == 404:
@@ -804,6 +1047,7 @@ class Plugin:
         voice["members"] = {str(member["accountId"]): member["platform"] for member in party.get("members", [])
                             if member.get("accountId") and str(member["accountId"]) != voice["account"]
                             and member.get("platform") in PLATFORMS}
+        voice["member_mutes"] = {str(member.get("accountId")): member_mute(member) for member in party.get("members", [])}
         voice["members_checked"] = time.monotonic()
         return party
 
@@ -821,7 +1065,7 @@ class Plugin:
                 except Exception as error:
                     raise ValueError("Sony's party voice signaling connection closed.") from error
                 raise ValueError("Sony's party voice signaling connection closed.")
-            if time.monotonic() - voice["members_checked"] >= 8:
+            if time.monotonic() - voice["members_checked"] >= 2:
                 await self._refresh_voice_members(voice)
             descriptions = []
             while not push.frames.empty():
@@ -841,7 +1085,7 @@ class Plugin:
                         decky.logger.info("Received PSN party voice %s from a party member.", description["type"])
                 else:
                     decky.logger.info("Ignored PSN custom message: sender is not in the active party.")
-            return {"members": list(voice["members"]), "descriptions": descriptions}
+            return {"members": list(voice["members"]), "descriptions": descriptions, "muted": voice.get("member_mutes", {})}
 
     async def send_voice_description(self, session, member, description):
         from voice_push import MAX_SDP, voice_payload
