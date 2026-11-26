@@ -436,6 +436,7 @@ class Plugin:
         } for row in result.get("parties", []) if row.get("sessionId")}
         for session_id in ids:
             parties.setdefault(session_id, {"id": session_id, "name": None, "members": [], "invited": True})
+        await self._update_presences([member for party in parties.values() for member in party["members"]])
         return list(parties.values())
 
     def _party_member(self):
@@ -768,14 +769,19 @@ class Plugin:
             ids = sorted({identifier(peer["peerId"]) for peer in peers
                           if peer.get("peerId") and peer["peerId"] != voice["peer"]})
             identities = {}
+            accounts = {}
             if ids:
                 try:
                     party = await self._refresh_voice_members(voice)
-                    identities = bridge_member_peers(party.get("members", []), session, voice["id"])
+                    members = party.get("members", [])
+                    identities = bridge_member_peers(members, session, voice["id"])
+                    accounts = {(member.get("deviceUniqueId") or "").lower(): str(member["accountId"])
+                                for member in members if member.get("accountId")}
                 except (ValueError, OSError):
                     # Bridge media remains usable while the party member view is unavailable.
                     pass
-            return [{"id": peer, "identity": identities.get(peer)} for peer in ids]
+            return [{"id": peer, "identity": identities.get(peer),
+                     "account": accounts.get((identities.get(peer) or "").lower())} for peer in ids]
 
     async def _stop_native_bridge(self, voice):
         process = voice.pop("native", None)
