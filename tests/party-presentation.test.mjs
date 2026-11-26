@@ -59,7 +59,10 @@ test('remote mute badge follows fresh voice metadata in both directions', () => 
     remote.muted = true;
     assert.equal(partyMemberPresentation(remote, profile, { active: true, peerStates: { 42: { state: 'connected', muted: false } } }).muted, false);
 });
-test('party browser uses member mute metadata before connecting voice', () => {
-    assert.equal(partyMemberPresentation({ ...player, muted: true }, profile, {}).muted, true);
+test('disconnected party clears both cached member and live peer mute badges', () => {
+    const cached = { ...player, muted: true };
+    assert.equal(partyMemberPresentation(cached, profile, {}).muted, false);
+    assert.equal(partyMemberPresentation(cached, profile, { active: false, peerStates: { 42: { muted: true } } }).muted, false);
+    assert.equal(partyMemberPresentation(cached, profile, { active: true }).muted, true);
     assert.equal(partyMemberPresentation(player, profile, {}).muted, false);
 });
