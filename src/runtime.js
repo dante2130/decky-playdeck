@@ -1287,14 +1287,15 @@ function PartyRowButton({ label, disabled, onClick, children }) {
             strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": true },
             SP_REACT.createElement("title", null, label), children));
 }
-function PartyMemberRow({ player }) {
+function PartyMemberRow({ player, action }) {
     return SP_REACT.createElement("div", { className: `psn-social-party-member${player.self ? " psn-social-you" : ""}` },
         SP_REACT.createElement("span", { className: "psn-social-player" },
             SP_REACT.createElement(ProfileAvatar, { player, showPresence: true }),
             SP_REACT.createElement("span", { className: "psn-social-player-copy" },
                 SP_REACT.createElement("strong", null, player.name),
                 SP_REACT.createElement("span", { className: "psn-social-player-subtitle", role: "status" },
-                    player.detail ?? [playerPresence(player), player.game].filter(Boolean).join(" · ")))));
+                    player.detail ?? [playerPresence(player), player.game].filter(Boolean).join(" · "))),
+            action));
 }
 function PlayerRow({ player, detail, action, disabled }) {
     const presence = playerPresence(player);
@@ -1615,20 +1616,31 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                 }))),
             tab === "Parties" && SP_REACT.createElement(DFL.PanelSection, null,
                 SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, "Party")),
+                    SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
+                        SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, "Party"),
+                        !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) &&
+                            SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
+                                SP_REACT.createElement(PartyRowButton, { label: "Create invite-only party", disabled: busy || voice.stopping,
+                                    onClick: () => partyAction(() => api.createParty(false), "Party created.", true) },
+                                    SP_REACT.createElement("rect", { x: 5, y: 10, width: 14, height: 11, rx: 2 }),
+                                    SP_REACT.createElement("path", { d: "M8 10V7a4 4 0 018 0v3m-4 5v2" })),
+                                SP_REACT.createElement(PartyRowButton, { label: "Create friends-only party", disabled: busy || voice.stopping,
+                                    onClick: () => partyAction(() => api.createParty(true), "Party created.", true) },
+                                    SP_REACT.createElement("circle", { cx: 9, cy: 7, r: 3 }),
+                                    SP_REACT.createElement("path", { d: "M3 21v-3a6 6 0 0112 0v3m1-17a3 3 0 010 6m2 4a5 5 0 013 4v3" }))))),
                 error && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement("div", { className: "psn-social-header-alert", role: "alert" }, error)),
-                !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) && SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    SP_REACT.createElement(DFL.DialogButton, { disabled: busy || voice.stopping, onClick: () => partyAction(() => api.createParty(false), "Party created.", true) }, "Create invite-only party")),
-                !voice.activeParty && !parties?.some(party => party.members.some(player => player.id === session.me.id)) && SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    SP_REACT.createElement(DFL.DialogButton, { style: { marginTop: 6 }, disabled: busy || voice.stopping, onClick: () => partyAction(() => api.createParty(true), "Party created.", true) }, "Create friends-only party")),
                 parties?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No parties or invitations."),
                 parties?.map(party => {
                     const member = party.members.some(player => player.id === session.me.id);
+                    const joinButton = !member && SP_REACT.createElement(PartyRowButton, { label: party.invited ? "Accept invitation" : "Join party",
+                        disabled: busy || voice.stopping || Boolean(voice.activeParty),
+                        onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, "Party joined.", true) },
+                        SP_REACT.createElement("path", { d: "M14 4h6v16h-6M3 12h12m-4-4 4 4-4 4" }));
                     return SP_REACT.createElement(DFL.PanelSectionRow, { key: party.id },
                         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { display: "grid", gap: 4 } },
                             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-                                SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, party.name || "PlayStation party"),
+                                SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, party.name || "Party"),
                                 member ? SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 4 } },
                                     SP_REACT.createElement(PartyRowButton, { label: voice.activeParty === party.id ? "Disconnect voice" : "Connect voice",
                                         disabled: busy || voice.stopping || Boolean(voice.activeParty && voice.activeParty !== party.id),
@@ -1652,11 +1664,8 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false }) {
                                             await api.leave(party.id);
                                         }, "Party left.") },
                                         SP_REACT.createElement("path", { d: "M10 4H4v16h6m-1-8h12m-4-4 4 4-4 4" }))) :
-                                    SP_REACT.createElement(PartyRowButton, { label: party.invited ? "Accept invitation" : "Join party",
-                                        disabled: busy || voice.stopping || Boolean(voice.activeParty),
-                                        onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, "Party joined.", true) },
-                                        SP_REACT.createElement("path", { d: "M14 4h6v16h-6M3 12h12m-4-4 4 4-4 4" }))),
-                            party.members.map(player => SP_REACT.createElement(PartyMemberRow, { key: player.id,
+                                    !party.members.length && joinButton),
+                            party.members.map((player, index) => SP_REACT.createElement(PartyMemberRow, { key: player.id, action: index === 0 ? joinButton : undefined,
                                 player: partyMemberPresentation(player, [session.me, ...session.friends].find(friend => friend.id === player.id), {
                                     self: player.id === session.me.id, active: voice.activeParty === party.id,
                                     connected: voice.status?.party === party.id && voice.status.connected,
