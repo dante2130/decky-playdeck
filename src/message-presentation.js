@@ -1,4 +1,4 @@
-export function formatMessageDate(value) {
+export function formatMessageDate(value, locale) {
     if (value === null || value === undefined || value === "")
         return "";
     if (typeof value !== "string" && typeof value !== "number")
@@ -9,7 +9,7 @@ export function formatMessageDate(value) {
     // Sony sends Unix milliseconds as a string, which Date otherwise treats as calendar text.
     const timestamp = typeof input === "string" && /^-?\d+(?:\.\d+)?$/.test(input) ? Number(input) : input;
     const date = new Date(timestamp);
-    return Number.isFinite(date.getTime()) ? date.toLocaleString() : "";
+    return Number.isFinite(date.getTime()) ? date.toLocaleString(locale) : "";
 }
 
 export function messageParticipant(member, profiles) {

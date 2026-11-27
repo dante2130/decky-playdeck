@@ -618,21 +618,32 @@ class Plugin:
         response = await self._api(f"{PARTIES}/users/me/partySessionsInvitations")
         keys = ("invitations", "partySessionsInvitations", "invitedPartySessions")
         invites = response if isinstance(response, list) else next((response[key] for key in keys if response.get(key)), [])
-        ids = []
+        invitations = {}
         for invite in invites:
             session = invite.get("party") or invite.get("session") or invite.get("v2PartySession") or {}
             session_id = invite.get("partySessionId") or invite.get("sessionId") or session.get("sessionId")
             if session_id:
-                ids.append(identifier(session_id))
-        result = await self._api(f"{PARTIES}/sys/gameBase/parties/bulkGet?limit=11", "POST",
-                                 {"groupInvitedPartySessions": list(dict.fromkeys(ids))[:11]})
+                sender = invite.get("from") or {}
+                invitations[identifier(session_id)] = {
+                    "invitationId": invite.get("invitationId"),
+                    "inviter": player(sender) if sender.get("accountId") else None,
+                }
+        bulk_url = f"{PARTIES}/sys/gameBase/parties/bulkGet?limit=11"
+        try:
+            result = await self._api(bulk_url, "POST", {"groupInvitedPartySessions": list(invitations)[:11]})
+        except PsnError as error:
+            if not invitations or error.status != 400:
+                raise
+            # An unusable invitation can make bulkGet reject the entire party list.
+            result = await self._api(bulk_url, "POST", {"groupInvitedPartySessions": []})
         parties = {row["sessionId"]: {
             "id": row["sessionId"], "name": row.get("sessionName"),
             "members": [player(member) for member in row.get("members", []) if member.get("accountId")],
-            "invited": row["sessionId"] in ids,
+            "invited": False,
         } for row in result.get("parties", []) if row.get("sessionId")}
-        for session_id in ids:
-            parties.setdefault(session_id, {"id": session_id, "name": None, "members": [], "invited": True})
+        for session_id, invite in invitations.items():
+            party = parties.setdefault(session_id, {"id": session_id, "name": None, "members": []})
+            party.update(invite, invited=True)
         if parties:
             try:
                 details = await self._api(f"{PARTIES}/partySessions?view=v3", headers={

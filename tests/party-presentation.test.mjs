@@ -1,8 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { partyMemberPresentation, bridgePeerState } from '../src/party-presentation.js';
+import { partyMemberPresentation, bridgePeerState, partySpeakingMembers } from '../src/party-presentation.js';
 const player = { id: '42', name: 'Player' };
 const profile = { status: 'online', avatar: 'avatar.png', game: 'Game' };
+
+test('party roster prefers real names from the member or their PSN profile', () => {
+    const namedProfile = { ...profile, fullName: 'Alex Example' };
+    assert.equal(partyMemberPresentation(player, namedProfile, {}).name, 'Alex Example');
+    assert.equal(partyMemberPresentation({ ...player, fullName: 'Alex Updated' }, namedProfile, {}).name, 'Alex Updated');
+    assert.equal(partyMemberPresentation(player, profile, {}).name, player.name);
+});
 
 test('bridge connection alone does not mark a remote player connected', () => {
     const result = partyMemberPresentation(player, profile, { active: true, connected: true });
@@ -30,6 +37,24 @@ test('mute and connection error are independent avatar indicators', () => {
 });
 test('idle players do not retain stale connection errors', () => {
     assert.equal(partyMemberPresentation(player, profile, { peerStates: { 42: { state: 'failed' } } }).voiceError, false);
+});
+test('speaker ring follows live audio and respects local mute', () => {
+    const voice = { active: true, connected: true, speaking: ['42'], peerStates: { 42: { state: 'connected' } } };
+    assert.equal(partyMemberPresentation(player, profile, voice).speaking, true);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, speaking: ['43'] }).speaking, false);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, active: false }).speaking, false);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, peerStates: {} }).speaking, true);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, failed: true }).speaking, false);
+    const staleRemoteMute = partyMemberPresentation(player, profile, { ...voice, peerStates: { 42: { state: 'connected', muted: true } } });
+    assert.equal(staleRemoteMute.speaking, true);
+    assert.equal(staleRemoteMute.muted, false);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, self: true, speaking: ['self'] }).speaking, true);
+    assert.equal(partyMemberPresentation(player, profile, { ...voice, self: true, speaking: ['self'], muted: true }).speaking, false);
+});
+test('unmapped bridge audio highlights a guest only when the roster identifies one', () => {
+    const me = { id: '1' };
+    assert.deepEqual(partySpeakingMembers(['bridge'], [player, me], me.id), ['bridge', player.id]);
+    assert.deepEqual(partySpeakingMembers(['bridge'], [player, me, { id: '2' }], me.id), ['bridge']);
 });
 test('unidentified peer times out instead of connecting forever', () => {
     assert.equal(partyMemberPresentation(player, profile, { active: true, startedAt: 1000, now: 31001 }).voiceError, true);

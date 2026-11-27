@@ -36,6 +36,21 @@ class MemberMuteTests(unittest.TestCase):
 
 
 class MemberViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_invite_survives_bulk_party_rejection(self):
+        plugin = backend.Plugin()
+        plugin._api = AsyncMock(side_effect=[
+            {"invitations": [{"sessionId": "invite-room", "invitationId": "invite-1",
+                              "from": {"accountId": "42", "onlineId": "Guest"}}]},
+            backend.PsnError(400, 2232321),
+            {"parties": []},
+            {"v2PartySessions": []},
+        ])
+        parties = await plugin.parties()
+        self.assertEqual(plugin._api.await_args_list[2].args[-1], {"groupInvitedPartySessions": []})
+        self.assertTrue(parties[0]["invited"])
+        self.assertEqual(parties[0]["invitationId"], "invite-1")
+        self.assertEqual(parties[0]["inviter"]["name"], "Guest")
+
     async def test_party_browser_uses_current_members_and_mute_flags(self):
         plugin = backend.Plugin()
         fields = decode(backend.PARTY_MEMBER_DATA)
