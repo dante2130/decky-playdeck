@@ -2,7 +2,9 @@ import { attachPlayback } from "./attachment-playback.js";
 import { formatMessageDate, messageListPlayer, messageParticipant, scrollConversationHistory, createConversationParty } from "./message-presentation.js";
 import { installPartyBadge } from "./party-badge.js";
 import { installSteamMainMenuEntry } from "./steam-main-menu.js";
-import { partyMemberPresentation, bridgePeerState, readVoiceConnectionMode } from "./party-presentation.js";
+import { partyMemberPresentation, bridgePeerState, partySpeakingMembers, readVoiceConnectionMode } from "./party-presentation.js";
+import { incomingMessages, partyNotifications, pendingPartyInvites } from "./social-notifications.js";
+import { initializeLanguage, languageOptions, setLanguage, t, translateError, useLanguage } from "./i18n.js";
 const manifest = {"name":"PlayDeck"};
 const API_VERSION = 2;
 const internalAPIConnection = window.__DECKY_SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED_deckyLoaderAPIInit;
@@ -158,7 +160,36 @@ function correctPartyAudioClock({ readable, writable }, report, playPacket) {
     });
     return readable.pipeThrough(transform).pipeTo(writable);
 }
-function createOpusPlayback(context, audio, active) {
+const speakerLevel = 0.008;
+function hasVoiceEnergy(samples) {
+    let energy = 0;
+    for (const sample of samples)
+        energy += sample * sample;
+    return energy > samples.length * speakerLevel ** 2;
+}
+function monitorVoice(context, stream) {
+    if (!context)
+        return;
+    try {
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        const samples = new Float32Array(analyser.fftSize);
+        source.connect(analyser);
+        return {
+            speaking() {
+                if (context.state !== "running")
+                    return false;
+                analyser.getFloatTimeDomainData(samples);
+                return hasVoiceEnergy(samples);
+            },
+            close: () => source.disconnect(),
+        };
+    }
+    catch {
+        // WebRTC audio levels remain available when Web Audio cannot open the stream.
+    }
+}
+function createOpusPlayback(context, audio, active, onSpeech) {
     const sources = new Map();
     const scheduled = new Set();
     let enabled = true;
@@ -197,6 +228,8 @@ function createOpusPlayback(context, audio, active) {
                             for (let channel = 0; channel < data.numberOfChannels; channel++) {
                                 data.copyTo(buffer.getChannelData(channel), { planeIndex: channel, format: "f32-planar" });
                             }
+                            if (hasVoiceEnergy(buffer.getChannelData(0)))
+                                onSpeech();
                             const now = context.currentTime;
                             if (lastTimestamp !== undefined) {
                                 const missed = Math.max(0, (data.timestamp - lastTimestamp) / 40000 - 1);
@@ -349,6 +382,7 @@ function closePeer(peer) {
     peer.connection.close();
     peer.clockWorker?.terminate();
     peer.opusPlayback?.close();
+    peer.voiceMonitor?.close();
     peer.audio.pause();
     peer.audio.srcObject = null;
 }
@@ -418,6 +452,7 @@ function useSharedPartyVoice() {
 }
 function PartyVoiceHost() {
     const voice = usePartyVoice();
+    SP_REACT.useEffect(startSocialNotifications, []);
     SP_REACT.useEffect(() => {
         voiceSnapshot = voice;
         partyBadge?.update(voice.status?.connected && voice.activeParty ?
@@ -425,6 +460,37 @@ function PartyVoiceHost() {
         voiceListeners.forEach(listener => listener());
     }, [voice]);
     return null;
+}
+async function samplePartySpeakers(call) {
+    const speakers = new Set();
+    if (!call.muted && call.micMonitor?.speaking())
+        speakers.add("self");
+    await Promise.all([...call.peers].map(async ([id, peer]) => {
+        if (peer.connection.connectionState !== "connected")
+            return;
+        const report = await peer.connection.getStats().catch(() => undefined);
+        if (call.peers.get(id) !== peer)
+            return;
+        const remote = call.mode === "server" ? call.bridgeSpeaker : id;
+        if (remote && (peer.voiceMonitor?.speaking() || performance.now() - peer.lastDecodedSpeech < 300))
+            speakers.add(remote);
+        report?.forEach(stat => {
+            if ((stat.kind ?? stat.mediaType) !== "audio" || !(stat.audioLevel > speakerLevel))
+                return;
+            if (stat.type === "media-source" && !call.muted)
+                speakers.add("self");
+            if (stat.type === "inbound-rtp" && remote)
+                speakers.add(remote);
+        });
+        if (remote && peer.connection.getReceivers().some(receiver =>
+            receiver.track.kind === "audio" && receiver.getSynchronizationSources().some(source => {
+                const timestamp = source.timestamp > performance.timeOrigin ? source.timestamp - performance.timeOrigin : source.timestamp;
+                const age = performance.now() - timestamp;
+                return age >= 0 && age < 250 && source.audioLevel > speakerLevel;
+            })))
+            speakers.add(remote);
+    }));
+    return [...speakers].sort();
 }
 function usePartyVoice() {
     const active = SP_REACT.useRef(undefined);
@@ -434,6 +500,37 @@ function usePartyVoice() {
     const [muteError, setMuteError] = SP_REACT.useState();
     const [bridgeStats, setBridgeStats] = SP_REACT.useState();
     const [peerStates, setPeerStates] = SP_REACT.useState({});
+    const [speaking, setSpeaking] = SP_REACT.useState([]);
+    SP_REACT.useEffect(() => {
+        const call = active.current;
+        setSpeaking([]);
+        if (!status?.connected || call?.party !== status.party)
+            return;
+        let cancelled = false;
+        let timer;
+        const lastHeard = new Map();
+        async function sample() {
+            const heard = await samplePartySpeakers(call);
+            if (cancelled || active.current !== call)
+                return;
+            const now = performance.now();
+            for (const id of heard)
+                lastHeard.set(id, now);
+            for (const [id, timestamp] of lastHeard) {
+                if (now - timestamp > 400)
+                    lastHeard.delete(id);
+            }
+            const next = [...lastHeard.keys()].sort();
+            setSpeaking(previous => previous.length === next.length &&
+                previous.every((id, index) => id === next[index]) ? previous : next);
+            timer = setTimeout(sample, 200);
+        }
+        void sample();
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [status?.party, status?.connected]);
     async function stop(message) {
         const call = active.current;
         if (!call)
@@ -443,6 +540,9 @@ function usePartyVoice() {
         for (const peer of call.peers.values())
             closePeer(peer);
         call.mic?.getTracks().forEach(track => track.stop());
+        call.micMonitor?.close();
+        if (call.monitorContext && call.monitorContext !== call.audioContext)
+            void call.monitorContext.close().catch(() => { });
         if (call.audioContext)
             void call.audioContext.close().catch(() => { });
         if (!message)
@@ -456,7 +556,7 @@ function usePartyVoice() {
             }
         }
         catch {
-            setStatus({ party: call.party, text: "Could not release the party voice session.", error: true });
+            setStatus({ party: call.party, text: t("Could not release the party voice session."), error: true });
         }
         finally {
             setStopping(false);
@@ -467,9 +567,9 @@ function usePartyVoice() {
         clearTimeout(call.timer);
         call.timer = setTimeout(() => {
             const waitingForReply = [...call.peers.values()].some(peer => peer.pendingOffer);
-            void stop(call.lastPeerError ? `Direct party voice failed (PSN peer error ${call.lastPeerError}).` :
-                waitingForReply ? "No PlayStation player replied to the voice offer." :
-                    "No party audio connection was established in time.");
+            void stop(call.lastPeerError ? t("Direct party voice failed (PSN peer error {code}).", { code: call.lastPeerError }) :
+                waitingForReply ? t("No PlayStation player replied to the voice offer.") :
+                    t("No party audio connection was established in time."));
         }, 30000);
     }
     function updateStatus(call) {
@@ -482,14 +582,14 @@ function usePartyVoice() {
             call.timer = undefined;
         }
         else if (!call.timer) {
-            call.timer = setTimeout(() => { void stop("Party audio disconnected. Connect voice to try again."); }, 15000);
+            call.timer = setTimeout(() => { void stop(t("Party audio disconnected. Connect voice to try again.")); }, 15000);
         }
         const waitingForReply = [...call.peers.values()].some(peer => peer.pendingOffer);
         const text = call.mode === "server"
-            ? connected ? "Sony voice bridge connected" : "Connecting to Sony’s voice bridge…"
-            : connected ? "Party voice connected" :
-                waitingForReply ? "Waiting for a PlayStation voice reply…" :
-                    call.peers.size ? "Connecting party audio…" : "Waiting for another party member…";
+            ? connected ? t("Sony voice bridge connected") : t("Connecting to Sony’s voice bridge…")
+            : connected ? t("Party voice connected") :
+                waitingForReply ? t("Waiting for a PlayStation voice reply…") :
+                    call.peers.size ? t("Connecting party audio…") : t("Waiting for another party member…");
         setStatus({ party: call.party, connected, text });
         if (call.mode !== "server")
             setPeerStates(Object.fromEntries([...call.peers].map(([id, peer]) => [id, {
@@ -511,14 +611,15 @@ function usePartyVoice() {
         const audio = new Audio();
         const peer = { connection, audio };
         if (legacyClock && call.audioContext) {
-            peer.opusPlayback = createOpusPlayback(call.audioContext, audio, () => { peer.decodingOpus = true; });
+            peer.opusPlayback = createOpusPlayback(call.audioContext, audio, () => { peer.decodingOpus = true; },
+                () => { peer.lastDecodedSpeech = performance.now(); });
         }
         call.peers.set(account, peer);
         connection.onconnectionstatechange = () => {
             if (connection.connectionState === "failed" && !nativeAudio) {
                 if ([...call.peers.values()].every(item => item.connection.connectionState === "failed")) {
-                    void stop(call.mode === "server" ? "The Sony voice bridge connection failed." :
-                        "No direct audio connection could be established with the party.");
+                    void stop(call.mode === "server" ? t("The Sony voice bridge connection failed.") :
+                        t("No direct audio connection could be established with the party."));
                     return;
                 }
             }
@@ -562,9 +663,11 @@ function usePartyVoice() {
                 return;
             attachClock(receiver);
             audio.srcObject = streams[0] ?? new MediaStream([track]);
+            peer.voiceMonitor?.close();
+            peer.voiceMonitor = monitorVoice(call.monitorContext, new MediaStream([track]));
             void audio.play().catch(() => {
                 if (active.current === call)
-                    void stop("Steam blocked party audio playback.");
+                    void stop(t("Steam blocked party audio playback."));
             });
         };
         for (const track of stream.getAudioTracks()) {
@@ -591,7 +694,7 @@ function usePartyVoice() {
             return;
         const answer = peer.connection.localDescription?.sdp;
         if (!answer)
-            throw new Error("Steam could not generate a Sony voice bridge answer.");
+            throw new Error(t("Steam could not generate a Sony voice bridge answer."));
         await answerBridgeVoice(call.party, partyVoiceSdp(answer, narrowband));
     }
     async function runBridge(call, stream, { offer, account, peer: bridgePeer, signalingId }, useNative = true) {
@@ -606,7 +709,7 @@ function usePartyVoice() {
                 return;
             const localOffer = peer.connection.localDescription?.sdp;
             if (!localOffer)
-                throw new Error("Steam could not open local party audio.");
+                throw new Error(t("Steam could not open local party audio."));
             const startup = startNativeBridge(call.party, offer, localOffer);
             call.signaling = startup;
             const result = await startup;
@@ -641,7 +744,7 @@ function usePartyVoice() {
         const hello = encoder.encode("hello");
         const user = { account_id: account, platform: 100001 };
         if (typeof signalingId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(signalingId))
-            throw new Error("Sony did not provide this device’s signaling identity.");
+            throw new Error(t("Sony did not provide this device’s signaling identity."));
         let userTableSequence = 0;
         const controlPeers = new Map();
         const peerAccounts = new Map();
@@ -817,7 +920,7 @@ function usePartyVoice() {
             try {
                 await setVoiceMute(call.party, !stream.getAudioTracks()[0].enabled);
             } catch {
-                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+                setMuteError(t("Could not share microphone mute status. Toggle mute to retry."));
             }
         }
         if (active.current !== call)
@@ -842,7 +945,7 @@ function usePartyVoice() {
                 call.nativeBridgeState = undefined;
                 clearTimeout(call.timer);
                 call.timer = undefined;
-                setStatus({ party: call.party, text: "Retrying Sony voice with Steam…" });
+                setStatus({ party: call.party, text: t("Retrying Sony voice with Steam…") });
                 const reopening = (async () => {
                     await stopVoice(call.party);
                     if (active.current === call)
@@ -856,7 +959,7 @@ function usePartyVoice() {
             }
             if (nativeStats && (nativeStats.state === "failed" || nativeStats.state === "closed" ||
                 peer.connection.connectionState === "failed")) {
-                throw new Error("The native Sony voice connection failed.");
+                throw new Error(t("The native Sony voice connection failed."));
             }
             if (nativeStats && call.nativeBridgeState !== nativeStats.state) {
                 call.nativeBridgeState = nativeStats.state;
@@ -870,6 +973,8 @@ function usePartyVoice() {
                     return;
                 const mediaSubscriptionPeers = bridgePeers.map(({ id }) => id);
                 remotePeerCount = mediaSubscriptionPeers.length;
+                if (remotePeerCount !== 1 || mediaSubscriptionPeers[0] !== subscribed?.[0])
+                    call.bridgeSpeaker = undefined;
                 const knownPeers = new Set(mediaSubscriptionPeers);
                 for (const [id, entry] of controlPeers) {
                     if (!knownPeers.has(id)) {
@@ -987,6 +1092,11 @@ function usePartyVoice() {
                 lastSource = source;
             }
             const states = {};
+            // A single bridge peer can carry multiple users. Require an exact mapping or a one-person roster.
+            const bridgeAccounts = subscribed?.length === 1 ? peerAccounts.get(subscribed[0]) : undefined;
+            call.bridgeSpeaker = remotePeerCount === 1 && subscribed?.length === 1
+                ? bridgeAccounts?.length === 1 ? bridgeAccounts[0] : "bridge"
+                : undefined;
             for (const [id, firstSeen] of peerFirstSeen) {
                 const state = bridgePeerState(controlPeers.get(id), subscription, Date.now(), firstSeen);
                 for (const account of peerAccounts.get(id) ?? [])
@@ -1017,7 +1127,7 @@ function usePartyVoice() {
             return;
         const sdp = peer.connection.localDescription?.sdp;
         if (!sdp)
-            throw new Error("Steam could not generate party voice signaling.");
+            throw new Error(t("Steam could not generate party voice signaling."));
         await sendDescription(call.party, account, { type, sequence, sdp: partyVoiceSdp(sdp) });
     }
     async function poll(call, stream) {
@@ -1086,15 +1196,17 @@ function usePartyVoice() {
         if (active.current || stopping)
             return;
         if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
-            setStatus({ party, text: "Microphone or WebRTC access is unavailable in this Steam session.", error: true });
+            setStatus({ party, text: t("Microphone or WebRTC access is unavailable in this Steam session."), error: true });
             return;
         }
         const call = { party, mode, peers: new Map(), startedAt: Date.now() };
-        if (mode === "server" && typeof AudioDecoder === "function" && typeof AudioContext === "function" &&
-            typeof RTCRtpReceiver.prototype.createEncodedStreams === "function") {
+        if (typeof AudioContext === "function") {
             try {
-                call.audioContext = new AudioContext();
-                void call.audioContext.resume().catch(() => { });
+                call.monitorContext = new AudioContext();
+                void call.monitorContext.resume().catch(() => { });
+                if (mode === "server" && typeof AudioDecoder === "function" &&
+                    typeof RTCRtpReceiver.prototype.createEncodedStreams === "function")
+                    call.audioContext = call.monitorContext;
             }
             catch {
                 // The WebRTC audio element remains available.
@@ -1105,8 +1217,8 @@ function usePartyVoice() {
         setMuted(false);
         setMuteError(undefined);
         setBridgeStats(undefined);
-        setStatus({ party, text: "Waiting for microphone access…" });
-        call.timer = setTimeout(() => { void stop("Steam did not grant microphone access in time."); }, 15000);
+        setStatus({ party, text: t("Waiting for microphone access…") });
+        call.timer = setTimeout(() => { void stop(t("Steam did not grant microphone access in time.")); }, 15000);
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: { echoCancellation: true, noiseSuppression: true },
@@ -1117,8 +1229,9 @@ function usePartyVoice() {
             }
             clearTimeout(call.timer);
             call.mic = stream;
+            call.micMonitor = monitorVoice(call.monitorContext, stream);
             if (mode === "server") {
-                setStatus({ party, text: "Opening Sony’s voice bridge…" });
+                setStatus({ party, text: t("Opening Sony’s voice bridge…") });
                 const opening = startBridgeVoice(party);
                 call.signaling = opening;
                 const offer = await opening;
@@ -1126,7 +1239,7 @@ function usePartyVoice() {
                     await runBridge(call, stream, offer);
                 return;
             }
-            setStatus({ party, text: "Connecting to Sony’s party signaling server…" });
+            setStatus({ party, text: t("Connecting to Sony’s party signaling server…") });
             call.signaling = startVoice(party);
             await call.signaling;
             if (active.current !== call)
@@ -1134,7 +1247,7 @@ function usePartyVoice() {
             try {
                 await setVoiceMute(call.party, !stream.getAudioTracks()[0].enabled);
             } catch {
-                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+                setMuteError(t("Could not share microphone mute status. Toggle mute to retry."));
             }
             waitForVoice(call);
             await poll(call, stream);
@@ -1142,7 +1255,7 @@ function usePartyVoice() {
         catch (error) {
             if (active.current === call) {
                 const detail = error instanceof Error ? error.message : String(error);
-                await stop(`Could not connect to party voice. ${detail}`);
+                await stop(t("Could not connect to party voice. {detail}", { detail: translateError(detail) }));
             }
         }
     }
@@ -1164,17 +1277,42 @@ function usePartyVoice() {
                 setMuteError(undefined);
         }).catch(() => {
             if (active.current === call && call.muted === nextMuted)
-                setMuteError("Could not share microphone mute status. Toggle mute to retry.");
+                setMuteError(t("Could not share microphone mute status. Toggle mute to retry."));
         });
     }
-    return { start, stop, status, bridgeStats, peerStates, startedAt: active.current?.startedAt, activeParty: active.current?.party, stopping, muted, muteError, toggleMute };
+    return { start, stop, status, bridgeStats, peerStates, speaking, startedAt: active.current?.startedAt, activeParty: active.current?.party, stopping, muted, muteError, toggleMute };
 }
 
+const fetchAccount = callable("load");
+const fetchParties = callable("parties");
+const signOut = callable("sign_out");
+let notificationAccount;
+let accountRequest;
+let lastPartyRead;
+function loadAccount() {
+    if (!accountRequest) {
+        const request = fetchAccount().then(account => {
+            if (accountRequest === request)
+                notificationAccount = account;
+            return account;
+        }).finally(() => {
+            if (accountRequest === request)
+                accountRequest = undefined;
+        });
+        accountRequest = request;
+    }
+    return accountRequest;
+}
 const api = {
     avatarImage: callable("avatar_image"),
-    load: callable("load"),
+    load: loadAccount,
     signIn: callable("sign_in"),
-    signOut: callable("sign_out"),
+    async signOut() {
+        await signOut();
+        accountRequest = undefined;
+        notificationAccount = null;
+        lastPartyRead = undefined;
+    },
     search: callable("search"),
     relationships: callable("relationships"),
     inbox: callable("inbox"),
@@ -1182,13 +1320,104 @@ const api = {
     messages: callable("messages"),
     attachment: callable("attachment_media"),
     send: callable("send_message"),
-    parties: callable("parties"),
+    async parties() {
+        const account = notificationAccount;
+        const parties = await fetchParties();
+        if (account && notificationAccount?.me.id === account.me.id)
+            lastPartyRead = { accountId: account.me.id, parties, time: Date.now() };
+        return parties;
+    },
     createParty: callable("create_party"),
     join: callable("join_party"),
     leave: callable("leave_party"),
     invite: callable("invite"),
 };
+function socialToast(title, body) {
+    api$1.toaster.toast({ title, body });
+}
+function startSocialNotifications() {
+    let cancelled = false;
+    const timers = [];
+    const seenInvites = new Map();
+    function poll(delay, update) {
+        let accountId;
+        let previous;
+        let timer;
+        async function check() {
+            try {
+                const account = notificationAccount === undefined ? await api.load() : notificationAccount;
+                if (account?.me.id !== accountId) {
+                    accountId = account?.me.id;
+                    previous = undefined;
+                }
+                if (account && !cancelled) {
+                    previous = await update(account, previous, () => !cancelled && notificationAccount?.me.id === accountId);
+                }
+            }
+            catch {
+                // Keep the last successful snapshot for the next check.
+            }
+            if (!cancelled)
+                timer = setTimeout(check, delay);
+        }
+        void check();
+        timers.push(() => clearTimeout(timer));
+    }
+    poll(4000, async (account, previous, active) => {
+        const recent = lastPartyRead?.accountId === account.me.id && Date.now() - lastPartyRead.time < 3000;
+        const next = recent ? lastPartyRead.parties : await api.parties();
+        if (!active())
+            return previous;
+        const key = `PLAYDECK_SEEN_PARTY_INVITES_${account.me.id}`;
+        if (!seenInvites.has(key)) {
+            let saved = [];
+            try {
+                const value = JSON.parse(localStorage.getItem(key) ?? "[]");
+                if (Array.isArray(value))
+                    saved = value;
+            }
+            catch { /* Keep an in-memory history if storage is unavailable. */ }
+            seenInvites.set(key, new Set(saved));
+        }
+        const seen = seenInvites.get(key);
+        for (const invite of pendingPartyInvites(next, account)) {
+            if (seen.has(invite.id))
+                continue;
+            socialToast(t("PlayDeck party"), invite.body);
+            seen.add(invite.id);
+            if (seen.size > 100)
+                seen.delete(seen.values().next().value);
+            try { localStorage.setItem(key, JSON.stringify([...seen])); }
+            catch { /* Keep the current invite in memory. */ }
+        }
+        if (previous)
+            for (const notice of partyNotifications(previous, next, account))
+                socialToast(t("PlayDeck party"), notice);
+        return next;
+    });
+    poll(15000, async (account, previous, active) => {
+        const checkedAt = Date.now();
+        const inbox = await api.inbox();
+        if (previous) {
+            for (const chat of inbox) {
+                const old = previous.latest.get(chat.id);
+                if (!active() || !chat.latest?.id || chat.latest.id === old?.id)
+                    continue;
+                const history = await api.messages(chat.id, chat.thread).catch(() => []);
+                if (active())
+                    for (const notice of incomingMessages(chat, old, history, account, previous.checkedAt))
+                        socialToast(t("PlayStation message"), notice);
+            }
+        }
+        return { latest: new Map(inbox.map(chat => [chat.id, chat.latest])), checkedAt };
+    });
+    return () => {
+        cancelled = true;
+        timers.forEach(clearTimer => clearTimer());
+    };
+}
 function useTask() {
+    const locale = useLanguage();
     const pending = SP_REACT.useRef(false);
     const [busy, setBusy] = SP_REACT.useState(false);
     const [error, setError] = SP_REACT.useState("");
@@ -1209,7 +1438,7 @@ function useTask() {
             setBusy(false);
         }
     }
-    return { run, busy, error };
+    return { run, busy, error: error ? translateError(error) : error, locale };
 }
 const rowStyles = `
   .psn-social-header { margin: 0 12px 8px; padding: 12px; background: #23272a; border-radius: 8px; }
@@ -1251,6 +1480,7 @@ const rowStyles = `
   .psn-social-avatar-muted { position: absolute; inset: 0; z-index: 2; border-radius: 50%; background: #0e141ba6; color: white; display: grid; place-items: center; }
   .psn-social-party-member { padding: 6px 4px; border-radius: 4px; }
   .psn-social-party-member.psn-social-you { background: rgba(102, 192, 244, 0.14); box-shadow: inset 2px 0 0 #66c0f4; }
+  .psn-social-party-member.psn-social-speaking :is(.psn-social-player-avatar, .psn-social-profile-avatar) { box-shadow: 0 0 0 2px #0070cc; }
   .psn-social-party-member .psn-social-player { gap: 10px; }
   .psn-social-party-member .psn-social-player-copy strong { font-weight: 700; }
   .psn-social-party-member .psn-social-player-copy { line-height: 1.4; }
@@ -1306,13 +1536,13 @@ function ProfileAvatar({ player, showPresence, compact = showPresence }) {
         Array.from(player.name)[0]?.toUpperCase(),
         avatar && SP_REACT.createElement("img", { key: avatar, src: avatar, alt: "", referrerPolicy: "no-referrer", onError: () => setFailedAvatars(previous => [...previous, avatar]) }),
         !avatar && fallbackImage && SP_REACT.createElement("img", { src: fallbackImage, alt: "", onError: event => { event.currentTarget.hidden = true; } }),
-        (player.muted || player.voiceError) && SP_REACT.createElement("span", { className: "psn-social-avatar-muted", role: "img", "aria-label": player.voiceError ? "Microphone connection error" : "Microphone muted" },
+        (player.muted || player.voiceError) && SP_REACT.createElement("span", { className: "psn-social-avatar-muted", role: "img", "aria-label": player.voiceError ? t("Microphone connection error") : t("Microphone muted") },
             SP_REACT.createElement("svg", { width: 25, height: 25, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round", "aria-hidden": true },
                 SP_REACT.createElement("path", { d: player.voiceError ? "M12 3a3 3 0 00-3 3v6a3 3 0 006 0V6a3 3 0 00-3-3M5 11v1a7 7 0 007 7m0 0v3m-3 0h6M17 16l5 5m0-5-5 5" : "M3 3l18 18M9 9v3a3 3 0 005 2M15 9V5a3 3 0 00-6 0M5 10v2a7 7 0 0012 5M19 10v2M12 19v3M8 22h8" }))),
         showPresence && !player.voiceState && SP_REACT.createElement("span", { className: "psn-social-presence", style: { background: presenceTone(player) } }));
 }
 function GroupAvatar({ players }) {
-    return SP_REACT.createElement("span", { className: "psn-social-group-avatar", role: "img", "aria-label": `${players.length} participants` },
+    return SP_REACT.createElement("span", { className: "psn-social-group-avatar", role: "img", "aria-label": t("{count} participants", { count: players.length }) },
         players.slice(0, 4).map((player, index) => SP_REACT.createElement("span", { key: player.id,
             style: { position: "absolute", left: (index % 2) * 16, top: Math.floor(index / 2) * 16 } },
             SP_REACT.createElement(ProfileAvatar, { player, compact: true, showPresence: false }))));
@@ -1326,25 +1556,25 @@ function PartyRowButton({ label, disabled, onClick, children }) {
 }
 function PartyCreateButtons({ disabled, create }) {
     return SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
-        SP_REACT.createElement(PartyRowButton, { label: "Create invite-only party", disabled, onClick: () => create(false) },
+        SP_REACT.createElement(PartyRowButton, { label: t("Create invite-only party"), disabled, onClick: () => create(false) },
             SP_REACT.createElement("rect", { x: 5, y: 10, width: 14, height: 11, rx: 2 }),
             SP_REACT.createElement("path", { d: "M8 10V7a4 4 0 018 0v3m-4 5v2" })),
-        SP_REACT.createElement(PartyRowButton, { label: "Create friends-only party", disabled, onClick: () => create(true) },
+        SP_REACT.createElement(PartyRowButton, { label: t("Create friends-only party"), disabled, onClick: () => create(true) },
             SP_REACT.createElement("circle", { cx: 9, cy: 7, r: 3 }),
             SP_REACT.createElement("path", { d: "M3 21v-3a6 6 0 0112 0v3m1-17a3 3 0 010 6m2 4a5 5 0 013 4v3" })));
 }
 function PartyMemberRow({ player, action }) {
-    return SP_REACT.createElement("div", { className: `psn-social-party-member${player.self ? " psn-social-you" : ""}` },
+    return SP_REACT.createElement("div", { className: `psn-social-party-member${player.self ? " psn-social-you" : ""}${player.speaking ? " psn-social-speaking" : ""}` },
         SP_REACT.createElement("span", { className: "psn-social-player" },
             SP_REACT.createElement(ProfileAvatar, { player, showPresence: true }),
             SP_REACT.createElement("span", { className: "psn-social-player-copy" },
-                SP_REACT.createElement("strong", null, player.name),
+                SP_REACT.createElement("strong", { "aria-label": player.speaking ? t("{name}, speaking", { name: player.name }) : undefined }, player.name),
                 SP_REACT.createElement("span", { className: "psn-social-player-subtitle", role: "status" },
-                    player.detail ?? [playerPresence(player), player.game].filter(Boolean).join(" · "))),
+                    (player.detail ? t(player.detail) : undefined) ?? [t(playerPresence(player)), player.game].filter(Boolean).join(" · "))),
             action));
 }
 function PlayerRow({ player, detail, action, disabled }) {
-    const presence = playerPresence(player);
+    const presence = t(playerPresence(player));
     const content = SP_REACT.createElement("span", { className: "psn-social-player" },
         player.avatarPlayers ? SP_REACT.createElement(GroupAvatar, { players: player.avatarPlayers }) :
             SP_REACT.createElement(ProfileAvatar, { player: player, showPresence: !player.hidePresence, compact: true }),
@@ -1365,6 +1595,7 @@ function Dialog({ closeModal, title, children }) {
             children));
 }
 function AttachmentViewer({ chat, message, index, attachment, initialMedia, closeModal }) {
+    useLanguage();
     const [media, setMedia] = SP_REACT.useState();
     const [error, setError] = SP_REACT.useState();
     const [attempt, setAttempt] = SP_REACT.useState(0);
@@ -1392,7 +1623,7 @@ function AttachmentViewer({ chat, message, index, attachment, initialMedia, clos
     function togglePlayback() {
         const element = player.current;
         if (!element) return;
-        if (element.paused) void element.play().catch(() => setError("Playback could not start. Try opening the attachment in your browser."));
+        if (element.paused) void element.play().catch(() => setError(t("Playback could not start. Try opening the attachment in your browser.")));
         else element.pause();
     }
     function seek(event) {
@@ -1406,24 +1637,24 @@ function AttachmentViewer({ chat, message, index, attachment, initialMedia, clos
     return SP_REACT.createElement(WideModal, { closeModal, fullWidth: true },
         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { width: "100%", display: "flex", flexDirection: "column", gap: 12, maxHeight: "80vh", overflowY: "auto" } },
             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-                SP_REACT.createElement("h2", { style: { margin: 0, overflowWrap: "anywhere" } }, attachment.label),
-                SP_REACT.createElement(ChatIcon, { label: "Close attachment", onClick: closeModal }, SP_REACT.createElement("path", { d: "m6 6 12 12M18 6 6 18" }))),
-            !media && !error && SP_REACT.createElement("div", { role: "status" }, "Loading attachment..."),
-            error && SP_REACT.createElement("div", { role: "alert" }, error),
-            media && !error && media.kind === "image" && SP_REACT.createElement("img", { src: media.url, alt: attachment.label, referrerPolicy: "no-referrer",
+                SP_REACT.createElement("h2", { style: { margin: 0, overflowWrap: "anywhere" } }, t(attachment.label)),
+                SP_REACT.createElement(ChatIcon, { label: t("Close attachment"), onClick: closeModal }, SP_REACT.createElement("path", { d: "m6 6 12 12M18 6 6 18" }))),
+            !media && !error && SP_REACT.createElement("div", { role: "status" }, t("Loading attachment...")),
+            error && SP_REACT.createElement("div", { role: "alert" }, translateError(error)),
+            media && !error && media.kind === "image" && SP_REACT.createElement("img", { src: media.url, alt: t(attachment.label), referrerPolicy: "no-referrer",
                 style: { width: "100%", maxWidth: "100%", height: "65vh", objectFit: "contain" },
-                onError: () => setError("This image could not be displayed. Retry to refresh its link.") }),
+                onError: () => setError(t("This image could not be displayed. Retry to refresh its link.")) }),
             media && !error && ["video", "audio"].includes(media.kind) && SP_REACT.createElement(DFL.Focusable, {
-                focusableIfEmpty: true, role: "group", "aria-label": "Attachment playback", onOKActionDescription: "Play / pause",
-                onActivate: togglePlayback, onGamepadDirection: seek, actionDescriptionMap: { 11: "Rewind 10 seconds", 12: "Forward 10 seconds" },
+                focusableIfEmpty: true, role: "group", "aria-label": t("Attachment playback"), onOKActionDescription: t("Play / pause"),
+                onActivate: togglePlayback, onGamepadDirection: seek, actionDescriptionMap: { 11: t("Rewind 10 seconds"), 12: t("Forward 10 seconds") },
             }, SP_REACT.createElement(media.kind, { ref: player, poster: media.kind === "video" ? media.preview : undefined,
                 controls: true, playsInline: true, preload: "metadata", tabIndex: -1,
                 style: { width: "100%", maxHeight: "65vh" },
-                onError: () => setError("This media could not be played. Try opening it in your browser.") })),
-            error && SP_REACT.createElement(DFL.DialogButton, { onClick: () => setAttempt(value => value + 1) }, "Retry attachment"),
+                onError: () => setError(t("This media could not be played. Try opening it in your browser.")) })),
+            error && SP_REACT.createElement(DFL.DialogButton, { onClick: () => setAttempt(value => value + 1) }, t("Retry attachment")),
             media?.downloadUrl?.startsWith("https://") && SP_REACT.createElement(DFL.DialogButton, {
                 onClick: () => window.SteamClient.System.OpenInSystemBrowser(media.downloadUrl),
-            }, media.kind === "file" ? "Open / download file" : "Open in browser")));
+            }, media.kind === "file" ? t("Open / download file") : t("Open in browser"))));
 }
 function AttachmentTile({ chat, message, attachment, index }) {
     const root = SP_REACT.useRef(null);
@@ -1458,13 +1689,13 @@ function AttachmentTile({ chat, message, attachment, index }) {
     }, [visible, inline, visual, chat.id, chat.thread, message.id, index]);
     if (inline) {
         return SP_REACT.createElement("span", { "data-playdeck-sticker": true, style: { display: "grid", placeItems: "center", width: 160, height: 160, maxWidth: "100%" } },
-            attachment.preview && !failed ? SP_REACT.createElement("img", { src: attachment.preview, alt: "Sticker", loading: "lazy", referrerPolicy: "no-referrer",
+            attachment.preview && !failed ? SP_REACT.createElement("img", { src: attachment.preview, alt: t("Sticker"), loading: "lazy", referrerPolicy: "no-referrer",
                 style: { width: "100%", height: "100%", objectFit: "contain" }, onError: () => setFailed(true) }) :
-                SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, "Sticker unavailable"));
+                SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, t("Sticker unavailable")));
     }
     const preview = attachment.kind === "image" ? media?.url : media?.thumbnail ?? media?.preview;
-    const label = attachment.kind === "video" ? "Play video" : attachment.kind === "audio" ? "Play voice message" :
-        attachment.kind === "file" ? `Open ${attachment.label}` : `View ${attachment.label.toLowerCase()}`;
+    const label = attachment.kind === "video" ? t("Play video") : attachment.kind === "audio" ? t("Play voice message") :
+        attachment.kind === "file" ? t("Open {attachment}", { attachment: t(attachment.label) }) : t("View {attachment}", { attachment: t(attachment.label) });
     return SP_REACT.createElement("span", { ref: root, "data-playdeck-attachment": attachment.kind, style: { display: "block", maxWidth: "100%" } },
         SP_REACT.createElement(DFL.DialogButton, { "aria-label": label, onOKActionDescription: label,
             onGamepadFocus: event => event.currentTarget?.scrollIntoView({ block: "nearest" }),
@@ -1475,7 +1706,7 @@ function AttachmentTile({ chat, message, attachment, index }) {
             visual && SP_REACT.createElement("span", { style: { width: "100%", height: 132, position: "relative", display: "grid", placeItems: "center", background: "#171c22", borderRadius: 4, overflow: "hidden" } },
                 preview && !failed && SP_REACT.createElement("img", { src: preview, alt: "", referrerPolicy: "no-referrer", onError: () => setFailed(true),
                     style: { width: "100%", height: "100%", objectFit: "cover" } }),
-                (!preview || failed) && SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, failed ? "Preview unavailable" : "Loading preview..."),
+                (!preview || failed) && SP_REACT.createElement("span", { style: { color: "#c3cad1", fontSize: 12 } }, failed ? t("Preview unavailable") : t("Loading preview...")),
                 attachment.kind === "video" && SP_REACT.createElement("span", { style: { position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "white", background: "#0003" }, "aria-hidden": true },
                     SP_REACT.createElement("svg", { width: 36, height: 36, viewBox: "0 0 24 24", fill: "currentColor" }, SP_REACT.createElement("path", { d: "M8 4v16l13-8z" })))),
             SP_REACT.createElement("span", { style: { fontSize: 12, overflowWrap: "anywhere" } }, label)));
@@ -1485,7 +1716,7 @@ function MessageAttachments({ chat, message }) {
         message.attachments.map((attachment, index) => SP_REACT.createElement(AttachmentTile, { key: index, chat, message, attachment, index })));
 }
 function Conversation({ me, title, chat, profiles = [], onOpenParty, closeModal, changed }) {
-    const { run, busy, error } = useTask();
+    const { run, busy, error, locale } = useTask();
     const voice = useSharedPartyVoice();
     const [createdParty, setCreatedParty] = SP_REACT.useState();
     function openParty() {
@@ -1502,7 +1733,7 @@ function Conversation({ me, title, chat, profiles = [], onOpenParty, closeModal,
             void voice.start(party, readVoiceConnectionMode());
         });
         if (failedInvites)
-            throw new Error(`Party created, but ${failedInvites} group invitation(s) could not be sent. Open the party to invite members again.`);
+            throw new Error(t("Party created, but {count} group invitation(s) could not be sent. Open the party to invite members again.", { count: failedInvites }));
         openParty();
     }
     const [messages, setMessages] = SP_REACT.useState([]);
@@ -1528,26 +1759,26 @@ function Conversation({ me, title, chat, profiles = [], onOpenParty, closeModal,
             history.current.scrollTop = history.current.scrollHeight;
     }, [messages]);
     return SP_REACT.createElement(WideModal, { closeModal: closeModal, fullWidth: true },
-        SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", onButtonDown: pageHistory, actionDescriptionMap: { 5: "Older messages", 6: "Newer messages" }, style: { width: "100%", minWidth: 0, boxSizing: "border-box", height: "min(510px, 70vh)", display: "flex", flexDirection: "column", gap: 8 } },
+        SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", onButtonDown: pageHistory, actionDescriptionMap: { 5: t("Older messages"), 6: t("Newer messages") }, style: { width: "100%", minWidth: 0, boxSizing: "border-box", height: "min(510px, 70vh)", display: "flex", flexDirection: "column", gap: 8 } },
             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
                 SP_REACT.createElement("h2", { style: { margin: 0 } }, title),
                 SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
                     chat.members.some(member => member.id !== me) && SP_REACT.createElement(ChatIcon, {
-                        label: createdParty ? "Open party" : "Create party", disabled: busy || voice.stopping || (!createdParty && Boolean(voice.activeParty)),
+                        label: createdParty ? t("Open party") : t("Create party"), disabled: busy || voice.stopping || (!createdParty && Boolean(voice.activeParty)),
                         onClick: () => createdParty ? openParty() : void run(createGroupParty),
                     }, headerIcons.Parties),
-                    SP_REACT.createElement(ChatIcon, { label: "Refresh conversation", disabled: busy, onClick: () => void run(refresh) }, headerIcons.Refresh))),
-            SP_REACT.createElement(DFL.Focusable, { ref: history, role: "log", "aria-label": "Conversation", tabIndex: 0, focusableIfEmpty: true,
-                focusClassName: "playdeck-history-focused", actionDescriptionMap: { 9: "Scroll up", 10: "Scroll down" },
+                    SP_REACT.createElement(ChatIcon, { label: t("Refresh conversation"), disabled: busy, onClick: () => void run(refresh) }, headerIcons.Refresh))),
+            SP_REACT.createElement(DFL.Focusable, { ref: history, role: "log", "aria-label": t("Conversation"), tabIndex: 0, focusableIfEmpty: true,
+                focusClassName: "playdeck-history-focused", actionDescriptionMap: { 9: t("Scroll up"), 10: t("Scroll down") },
                 onGamepadDirection: event => scrollConversationHistory(history.current, event),
                 onKeyDown: event => scrollConversationHistory(history.current, event),
                 style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", scrollBehavior: "auto", overscrollBehavior: "contain", padding: 6 } },
-                !messages.length && SP_REACT.createElement("p", null, busy ? "Loading conversation…" : "No messages."),
+                !messages.length && SP_REACT.createElement("p", null, busy ? t("Loading conversation…") : t("No messages.")),
                 messages.map((item, index) => {
                     const mine = item.sender === me;
-                    const date = formatMessageDate(item.date);
+                    const date = formatMessageDate(item.date, locale.language);
                     const member = chat.members.find(player => player.id === item.sender);
-                    const sender = messageParticipant({ id: item.sender, name: item.name ?? member?.name ?? "Player",
+                    const sender = messageParticipant({ id: item.sender, name: item.name ?? member?.name ?? t("Player"),
                         avatar: member?.avatar ?? item.avatar,
                         avatars: [...new Set([...(member?.avatars ?? []), ...(item.avatars ?? [])])] }, profiles);
                     const avatar = groupChat && SP_REACT.createElement(ProfileAvatar, { player: sender, compact: true, showPresence: false });
@@ -1558,18 +1789,18 @@ function Conversation({ me, title, chat, profiles = [], onOpenParty, closeModal,
                         SP_REACT.createElement("div", { style: { display: "flex", flexDirection: "column", flex: "1 1 0", minWidth: 0,
                             alignItems: mine ? "flex-end" : "flex-start" } },
                             !mine && item.name && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, item.name),
-                            SP_REACT.createElement("div", { "aria-label": mine ? "You" : item.name ?? title, style: {
+                            SP_REACT.createElement("div", { "aria-label": mine ? t("You") : item.name ?? title, style: {
                                     maxWidth: "85%", padding: "7px 11px", color: "#fff",
                                     background: mine ? "#286c36" : "#353b42",
                                     borderRadius: mine ? "13px 13px 3px 13px" : "13px 13px 13px 3px",
                                     overflowWrap: "anywhere", whiteSpace: "pre-wrap",
-                                } }, item.text ?? (!item.attachments?.length ? "Attachment or system message" : null),
+                                } }, item.text ?? (!item.attachments?.length ? t("Attachment or system message") : null),
                                 Boolean(item.attachments?.length) && SP_REACT.createElement(MessageAttachments, { chat, message: item })),
                             date && SP_REACT.createElement("small", { style: { color: "#c3cad1" } }, date)),
                         mine && avatar);
                 })),
             error && SP_REACT.createElement("div", { role: "alert" }, error),
-            SP_REACT.createElement(DFL.TextField, { label: "Message", value: draft, disabled: busy, inlineControls: SP_REACT.createElement(ChatIcon, { label: "Send message", disabled: busy || !draft.trim(), inline: true, onClick: () => void run(async () => {
+            SP_REACT.createElement(DFL.TextField, { label: t("Message"), value: draft, disabled: busy, inlineControls: SP_REACT.createElement(ChatIcon, { label: t("Send message"), disabled: busy || !draft.trim(), inline: true, onClick: () => void run(async () => {
                         await api.send(chat.id, chat.thread, draft);
                         setDraft("");
                         changed();
@@ -1588,14 +1819,14 @@ function SearchDialog({ openChat, closeModal }) {
     const { run, busy, error } = useTask();
     const [query, setQuery] = SP_REACT.useState("");
     const [results, setResults] = SP_REACT.useState();
-    return SP_REACT.createElement(Dialog, { title: "Search PlayStation Network", closeModal: closeModal },
-        SP_REACT.createElement(DFL.TextField, { label: "Online ID", value: query, disabled: busy, onChange: event => setQuery(event.currentTarget.value) }),
+    return SP_REACT.createElement(Dialog, { title: t("Search PlayStation Network"), closeModal: closeModal },
+        SP_REACT.createElement(DFL.TextField, { label: t("Online ID"), value: query, disabled: busy, onChange: event => setQuery(event.currentTarget.value) }),
         SP_REACT.createElement(DFL.DialogButton, { disabled: busy || !query.trim(), onClick: () => void run(async () => {
                 setResults(await api.search(query.trim()));
-            }) }, "Search"),
-        busy && SP_REACT.createElement("div", { role: "status" }, "Searching\u2026"),
+            }) }, t("Search")),
+        busy && SP_REACT.createElement("div", { role: "status" }, t("Searching…")),
         error && SP_REACT.createElement("div", { role: "alert" }, error),
-        results?.length === 0 && SP_REACT.createElement("div", null, "No players found."),
+        results?.length === 0 && SP_REACT.createElement("div", null, t("No players found.")),
         results?.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: player, disabled: busy, action: () => {
                 closeModal?.();
                 openChat(player);
@@ -1605,10 +1836,10 @@ function InviteDialog({ party, friends, closeModal }) {
     const { run, busy, error } = useTask();
     const [sent, setSent] = SP_REACT.useState([]);
     const available = friends.filter(friend => !party.members.some(member => member.id === friend.id));
-    return SP_REACT.createElement(Dialog, { title: "Invite friends", closeModal: closeModal },
+    return SP_REACT.createElement(Dialog, { title: t("Invite friends"), closeModal: closeModal },
         error && SP_REACT.createElement("div", { role: "alert" }, error),
-        !available.length && SP_REACT.createElement("div", null, "No friends available to invite."),
-        available.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: player, detail: sent.includes(player.id) ? "Invitation sent" : undefined, disabled: busy || sent.includes(player.id), action: () => void run(async () => {
+        !available.length && SP_REACT.createElement("div", null, t("No friends available to invite.")),
+        available.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: player, detail: sent.includes(player.id) ? t("Invitation sent") : undefined, disabled: busy || sent.includes(player.id), action: () => void run(async () => {
                 await api.invite(party.id, player.id);
                 setSent(previous => [...previous, player.id]);
             }) })));
@@ -1625,13 +1856,13 @@ function RelationshipsDialog({ closeModal }) {
         });
     }
     SP_REACT.useEffect(() => { load(false); }, []);
-    return SP_REACT.createElement(Dialog, { title: "Friend requests and blocked players", closeModal: closeModal },
+    return SP_REACT.createElement(Dialog, { title: t("Friend requests and blocked players"), closeModal: closeModal },
         SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", flexWrap: "wrap", gap: 4 } },
-            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, "aria-pressed": !blocked, onClick: () => load(false) }, "Incoming requests"),
-            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, "aria-pressed": blocked, onClick: () => load(true) }, "Blocked players")),
-        busy && SP_REACT.createElement("div", { role: "status" }, "Loading\u2026"),
+            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, "aria-pressed": !blocked, onClick: () => load(false) }, t("Incoming requests")),
+            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, "aria-pressed": blocked, onClick: () => load(true) }, t("Blocked players"))),
+        busy && SP_REACT.createElement("div", { role: "status" }, t("Loading…")),
         error && SP_REACT.createElement("div", { role: "alert" }, error),
-        players?.length === 0 && SP_REACT.createElement("div", null, blocked ? "No blocked players." : "No incoming requests."),
+        players?.length === 0 && SP_REACT.createElement("div", null, blocked ? t("No blocked players.") : t("No incoming requests.")),
         players?.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: player })));
 }
 const tabs = ["Friends", "Messages", "Parties"];
@@ -1656,46 +1887,70 @@ const headerIcons = {
     Refresh: SP_REACT.createElement("path", { d: "M20 9a8 8 0 0 0-14-3L3 9m0-5v5h5m-4 6a8 8 0 0 0 14 3l3-3m0 5v-5h-5" }),
 };
 function HeaderButton({ label, active, disabled, className, onClick }) {
-    return SP_REACT.createElement(DFL.DialogButton, { className: ["psn-social-control", active && "psn-social-active", className].filter(Boolean).join(" "), "aria-pressed": active, "aria-label": label, onOKActionDescription: label, disabled: disabled, onClick: onClick },
+    const text = t(label);
+    return SP_REACT.createElement(DFL.DialogButton, { className: ["psn-social-control", active && "psn-social-active", className].filter(Boolean).join(" "), "aria-pressed": active, "aria-label": text, onOKActionDescription: text, disabled: disabled, onClick: onClick },
         SP_REACT.createElement("svg", { width: "16", height: "16", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: "1.8", fill: "none", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
-            SP_REACT.createElement("title", null, label),
+            SP_REACT.createElement("title", null, text),
             headerIcons[label]));
 }
-function AccountSettings({ session, connected, disconnect, voiceMode, changeVoiceMode, closeModal }) {
-    const { run, busy, error } = useTask();
+function AccountSettings({ session, connected, disconnect, voiceMode, changeVoiceMode, menuVisibility, closeModal }) {
+    const { run, busy, error, locale } = useTask();
     const [account, setAccount] = SP_REACT.useState(session);
     const [mode, setMode] = SP_REACT.useState(voiceMode);
+    const [showInMenu, setShowInMenu] = SP_REACT.useState(menuVisibility.enabled);
     const [code, setCode] = SP_REACT.useState("");
-    return SP_REACT.createElement(Dialog, { title: "PlayDeck settings", closeModal },
-        SP_REACT.createElement("strong", null, "Party voice connection"),
+    return SP_REACT.createElement(Dialog, { title: t("PlayDeck settings"), closeModal },
+        SP_REACT.createElement(DFL.DropdownItem, {
+            label: t("Language"),
+            rgOptions: languageOptions.map(option => ({ ...option, label: t(option.label) })),
+            selectedOption: locale.preference,
+            disabled: busy,
+            onChange: option => void run(async () => {
+                try { setLanguage(option.data); }
+                catch { throw new Error(t("Could not save the language setting.")); }
+            }),
+        }),
+        SP_REACT.createElement(DFL.ToggleField, {
+            label: t("Show PlayDeck in the Steam menu"), checked: showInMenu, disabled: busy,
+            onChange: enabled => void run(async () => {
+                menuVisibility.setEnabled(enabled);
+                setShowInMenu(enabled);
+            }),
+        }),
+        SP_REACT.createElement("strong", null, t("Party voice connection")),
         SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
-            [["server", "Auto"], ["direct", "Direct"]].map(([value, label]) => SP_REACT.createElement(DFL.DialogButton, {
+            [["server", t("Auto")], ["direct", t("Direct")]].map(([value, label]) => SP_REACT.createElement(DFL.DialogButton, {
                 key: value, "aria-pressed": mode === value, disabled: busy,
                 style: mode === value ? { background: "#fff", color: "#0e141b" } : undefined,
                 onClick: () => void run(async () => { changeVoiceMode(value); setMode(value); }),
             }, label))),
-        SP_REACT.createElement("div", { className: "psn-social-player-subtitle" }, "Used when joining or connecting to party voice."),
-        account ? SP_REACT.createElement(SP_REACT.Fragment, null,
-            SP_REACT.createElement("div", null, `Connected as ${account.me.name}`),
-            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, onClick: () => void run(async () => {
-                await disconnect();
-                setAccount(null);
-            }) }, "Disconnect PlayStation Network")) : SP_REACT.createElement(SP_REACT.Fragment, null,
-            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, onClick: () => window.SteamClient.System.OpenInSystemBrowser("https://ca.account.sony.com/api/v1/ssocookie") }, "Get Sony NPSSO code"),
-            SP_REACT.createElement(DFL.TextField, { bIsPassword: true, label: "Sony NPSSO code", disabled: busy, value: code, onChange: event => setCode(event.currentTarget.value) }),
+        SP_REACT.createElement("div", { className: "psn-social-player-subtitle" }, t("Used when joining or connecting to party voice.")),
+        account ? SP_REACT.createElement(DFL.ToggleField, {
+            label: "PlayStation Network", description: t("Connected as {name}", { name: account.me.name }),
+            checked: true, disabled: busy,
+            onChange: enabled => {
+                if (!enabled)
+                    void run(async () => {
+                        await disconnect();
+                        setAccount(null);
+                    });
+            },
+        }) : SP_REACT.createElement(SP_REACT.Fragment, null,
+            SP_REACT.createElement(DFL.DialogButton, { disabled: busy, onClick: () => window.SteamClient.System.OpenInSystemBrowser("https://ca.account.sony.com/api/v1/ssocookie") }, t("Get Sony NPSSO code")),
+            SP_REACT.createElement(DFL.TextField, { bIsPassword: true, label: t("Sony NPSSO code"), disabled: busy, value: code, onChange: event => setCode(event.currentTarget.value) }),
             SP_REACT.createElement(DFL.DialogButton, { disabled: busy || !code.trim(), onClick: () => void run(async () => {
                 await api.signIn(code);
                 setCode("");
                 const next = await api.load();
                 if (!next)
-                    throw new Error("Could not load the connected PlayStation account. Try again.");
+                    throw new Error(t("Could not load the connected PlayStation account. Try again."));
                 connected(next);
                 setAccount(next);
-            }) }, "Connect PlayStation Network")),
-        busy && SP_REACT.createElement("div", { role: "status" }, "Connecting..."),
+            }) }, t("Connect PlayStation Network"))),
+        busy && SP_REACT.createElement("div", { role: "status" }, t("Connecting...")),
         error && SP_REACT.createElement("div", { role: "alert" }, error));
 }
-function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenParty }) {
+function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenParty, menuVisibility }) {
     const { run, busy, error } = useTask();
     const voice = useSharedPartyVoice();
     const [session, setSession] = SP_REACT.useState();
@@ -1704,11 +1959,34 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
     const [inbox, setInbox] = SP_REACT.useState();
     const [parties, setParties] = SP_REACT.useState();
     const [inboxDirty, setInboxDirty] = SP_REACT.useState(false);
+    const accountId = session?.me.id;
     SP_REACT.useEffect(() => { void run(async () => {
         setSession(await api.load());
         if (initialTab === "Parties")
             setParties(await api.parties());
     }); }, []);
+    SP_REACT.useEffect(() => {
+        if (!accountId || tab !== "Parties" || busy)
+            return;
+        let cancelled = false;
+        let timer = setTimeout(refreshParties, 3000);
+        async function refreshParties() {
+            try {
+                const next = await api.parties();
+                if (!cancelled)
+                    setParties(next);
+            }
+            catch {
+                // Keep the previous roster visible and retry after a transient failure.
+            }
+            if (!cancelled)
+                timer = setTimeout(refreshParties, 3000);
+        }
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [accountId, tab, busy]);
     SP_REACT.useEffect(() => {
         if (settingsOnOpen && session && !settingsOpened.current) {
             settingsOpened.current = true;
@@ -1716,7 +1994,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
         }
     }, [Boolean(session)]);
     function title(chat, me) {
-        return chat.name || chat.members.filter(member => member.id !== me.id).map(member => member.name).join(", ") || "Conversation";
+        return chat.name || chat.members.filter(member => member.id !== me.id).map(member => member.name).join(", ") || t("Conversation");
     }
     function openChat(chat, label, me) {
         const profiles = [me, ...session.friends];
@@ -1753,12 +2031,12 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
             }
             catch (error) {
                 setParties(undefined);
-                throw new Error(`${success} The party list could not refresh. ${error instanceof Error ? error.message : String(error)}`);
+                throw new Error(t("{success} The party list could not refresh. {detail}", { success, detail: translateError(error instanceof Error ? error.message : String(error)) }));
             }
         });
     }
     function openSettings() {
-        DFL.showModal(SP_REACT.createElement(AccountSettings, { session, connected: setSession, voiceMode: readVoiceConnectionMode(), changeVoiceMode: mode => {
+        DFL.showModal(SP_REACT.createElement(AccountSettings, { session, connected: setSession, menuVisibility, voiceMode: readVoiceConnectionMode(), changeVoiceMode: mode => {
             localStorage.setItem("PLAYDECK_VOICE_CONNECTION", mode);
         }, disconnect: async () => {
             await voice.stop();
@@ -1773,7 +2051,7 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
         SP_REACT.createElement("style", null, rowStyles),
         !session && SP_REACT.createElement("header", { className: "psn-social-header" },
             SP_REACT.createElement("strong", null, "PlayStation Network"),
-            SP_REACT.createElement("div", { className: "psn-social-header-status", role: "status" }, busy ? "Connecting..." : "Connect your PlayStation account in settings."),
+            SP_REACT.createElement("div", { className: "psn-social-header-status", role: "status" }, busy ? t("Connecting...") : t("Connect your PlayStation account in settings.")),
             SP_REACT.createElement(DFL.Focusable, { className: "psn-social-nav", "flow-children": "row" },
                 SP_REACT.createElement(HeaderButton, { label: "Refresh", className: "psn-social-action-start", disabled: busy, onClick: () => void run(async () => setSession(await api.load())) }),
                 SP_REACT.createElement(HeaderButton, { label: "Settings", onClick: openSettings })),
@@ -1781,14 +2059,14 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
         session && SP_REACT.createElement(SP_REACT.Fragment, null,
             SP_REACT.createElement("header", { className: "psn-social-header" },
                 SP_REACT.createElement("div", { className: "psn-social-profile" },
-                    SP_REACT.createElement(ProfileAvatar, { player: { ...session.me, muted: Boolean(voice.activeParty) && voice.muted } }),
+                    SP_REACT.createElement(ProfileAvatar, { player: session.me }),
                     SP_REACT.createElement("div", { className: "psn-social-profile-copy" },
                         SP_REACT.createElement("strong", null, session.me.name),
                         SP_REACT.createElement("div", { className: "psn-social-profile-meta" },
                             SP_REACT.createElement("span", null,
                                 SP_REACT.createElement("span", { className: "psn-social-profile-dot", style: { background: presenceTone(session.me) } }),
-                                playerPresence(session.me)),
-                            session.me.level != null && SP_REACT.createElement("span", { className: "psn-social-trophy", "aria-label": `Trophy level ${session.me.level}` },
+                                t(playerPresence(session.me))),
+                            session.me.level != null && SP_REACT.createElement("span", { className: "psn-social-trophy", "aria-label": t("Trophy level {level}", { level: session.me.level }) },
                                 SP_REACT.createElement("svg", { viewBox: "0 0 24 24", width: "15", height: "15", fill: "none", stroke: "currentColor", strokeWidth: "2", "aria-hidden": "true" },
                                     SP_REACT.createElement("path", { d: "M8 3h8v5a4 4 0 0 1-8 0V3Zm0 2H4v2a4 4 0 0 0 4 4m8-6h4v2a4 4 0 0 1-4 4m-4 1v7m-4 0h8" })),
                                 session.me.level)))),
@@ -1803,10 +2081,10 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
                     SP_REACT.createElement(HeaderButton, { label: "Refresh", disabled: busy, onClick: () => void run(() => loadTab(tab)) }),
                     SP_REACT.createElement(HeaderButton, { label: "Settings", onClick: openSettings })),
                 error && tab !== "Parties" && SP_REACT.createElement("div", { className: "psn-social-header-alert", role: "alert" }, error),
-                busy && SP_REACT.createElement("div", { className: "psn-social-header-status", role: "status" }, "Working\u2026")),
+                busy && SP_REACT.createElement("div", { className: "psn-social-header-status", role: "status" }, t("Working…"))),
             tab === "Friends" && SP_REACT.createElement(DFL.PanelSection, null,
                 SP_REACT.createElement("section", { className: "psn-social-list" },
-                    SP_REACT.createElement("h2", null, "Friends"),
+                    SP_REACT.createElement("h2", null, t("Friends")),
                     ["Online", "Offline", "Unknown"].map(group => {
                         const players = session.friends.filter(player => {
                             const presence = playerPresence(player);
@@ -1814,44 +2092,47 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
                         }).sort((a, b) => a.name.localeCompare(b.name));
                         if (!players.length && group !== "Online")
                             return null;
-                        return SP_REACT.createElement("section", { key: group, className: "psn-social-group", "aria-label": group },
+                        return SP_REACT.createElement("section", { key: group, className: "psn-social-group", "aria-label": t(group) },
                             SP_REACT.createElement("h3", null,
-                                group,
+                                t(group),
                                 " ",
                                 SP_REACT.createElement("span", null, players.length)),
-                            !players.length && SP_REACT.createElement("div", null, "No friends online."),
+                            !players.length && SP_REACT.createElement("div", null, t("No friends online.")),
                             players.map(player => SP_REACT.createElement(PlayerRow, { key: player.id, player: player, disabled: busy, action: () => messagePlayer(player) })));
                     }))),
             tab === "Messages" && SP_REACT.createElement(DFL.PanelSection, null,
                 SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0, textTransform: "none" } }, "Messages")),
-                inbox?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No conversations."),
+                    SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0, textTransform: "none" } }, t("Messages"))),
+                inbox?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, t("No conversations.")),
                 SP_REACT.createElement("div", { className: "psn-social-list psn-social-group" }, inbox?.map(chat => {
                     const name = title(chat, session.me);
-                    const preview = chat.latest?.text ?? chat.latest?.attachments?.[0]?.label ?? (chat.latest ? "Attachment or system message" : "No messages");
+                    const preview = chat.latest?.text ?? t(chat.latest?.attachments?.[0]?.label ?? (chat.latest ? "Attachment or system message" : "No messages"));
                     return SP_REACT.createElement(PlayerRow, { key: chat.id, player: messageListPlayer(chat, session.me.id, session.friends, name), detail: chat.unread ? `● ${preview}` : preview, disabled: busy, action: () => openChat(chat, name, session.me) });
                 }))),
             tab === "Parties" && SP_REACT.createElement(DFL.PanelSection, null,
                 !parties?.length && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-                        SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, "Party"),
+                        SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, t("Party")),
                         !voice.activeParty && SP_REACT.createElement(PartyCreateButtons, { disabled: busy || voice.stopping,
-                            create: friends => partyAction(() => api.createParty(friends), "Party created.", true) }))),
+                            create: friends => partyAction(() => api.createParty(friends), t("Party created."), true) }))),
                 error && SP_REACT.createElement(DFL.PanelSectionRow, null,
                     SP_REACT.createElement("div", { className: "psn-social-header-alert", role: "alert" }, error)),
-                parties?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, "No parties or invitations."),
+                parties?.length === 0 && SP_REACT.createElement(DFL.PanelSectionRow, null, t("No parties or invitations.")),
                 parties?.map((party, partyIndex) => {
                     const member = party.members.some(player => player.id === session.me.id);
-                    const joinButton = !member && SP_REACT.createElement(PartyRowButton, { label: party.invited ? "Accept invitation" : "Join party",
+                    const speaking = partySpeakingMembers(voice.speaking, party.members, session.me.id);
+                    const orderedMembers = [...party.members].sort((a, b) =>
+                        Number(b.id === session.me.id) - Number(a.id === session.me.id));
+                    const joinButton = !member && SP_REACT.createElement(PartyRowButton, { label: party.invited ? t("Accept invitation") : t("Join party"),
                         disabled: busy || voice.stopping || Boolean(voice.activeParty),
-                        onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, "Party joined.", true) },
+                        onClick: () => partyAction(async () => { await api.join(party.id); return party.id; }, t("Party joined."), true) },
                         SP_REACT.createElement("path", { d: "M14 4h6v16h-6M3 12h12m-4-4 4 4-4 4" }));
                     return SP_REACT.createElement(DFL.PanelSectionRow, { key: party.id },
                         SP_REACT.createElement(DFL.Focusable, { "flow-children": "column", style: { display: "grid", gap: 4 } },
                             SP_REACT.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-                                SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, party.name || "Party"),
+                                SP_REACT.createElement("h2", { style: { fontSize: 14, margin: 0 } }, party.name || t("Party")),
                                 member ? SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 4 } },
-                                    SP_REACT.createElement(PartyRowButton, { label: voice.activeParty === party.id ? "Disconnect voice" : "Connect voice",
+                                    SP_REACT.createElement(PartyRowButton, { label: voice.activeParty === party.id ? t("Disconnect voice") : t("Connect voice"),
                                         disabled: busy || voice.stopping || Boolean(voice.activeParty && voice.activeParty !== party.id),
                                         onClick: () => voice.activeParty === party.id ? void voice.stop() : void voice.start(party.id, readVoiceConnectionMode()) },
                                         SP_REACT.createElement("path", { d: "M3 14v-2a9 9 0 0118 0v2m-1 5c-1 2-3 2-6 2" }),
@@ -1859,33 +2140,33 @@ function SocialPanel({ initialTab = "Friends", settingsOnOpen = false, onOpenPar
                                         SP_REACT.createElement("rect", { x: 17, y: 12, width: 4, height: 7, rx: 2 }),
                                         voice.activeParty === party.id && SP_REACT.createElement("path", { d: "m3 3 18 18" })),
                                     voice.activeParty === party.id && voice.status?.connected && SP_REACT.createElement(PartyRowButton, {
-                                        label: voice.muted ? "Unmute microphone" : "Mute microphone", disabled: busy, onClick: voice.toggleMute },
+                                        label: voice.muted ? t("Unmute microphone") : t("Mute microphone"), disabled: busy, onClick: voice.toggleMute },
                                         SP_REACT.createElement("rect", { x: 9, y: 3, width: 6, height: 12, rx: 3 }),
                                         SP_REACT.createElement("path", { d: "M5 11a7 7 0 0014 0m-7 7v3m-3 0h6" }),
                                         voice.muted && SP_REACT.createElement("path", { d: "m3 3 18 18" })),
-                                    SP_REACT.createElement(PartyRowButton, { label: "Invite friends", disabled: busy,
+                                    SP_REACT.createElement(PartyRowButton, { label: t("Invite friends"), disabled: busy,
                                         onClick: () => DFL.showModal(SP_REACT.createElement(InviteDialog, { party, friends: session.friends })) },
                                         SP_REACT.createElement("circle", { cx: 8, cy: 7, r: 3 }),
                                         SP_REACT.createElement("path", { d: "M2 20v-2a4 4 0 014-4h4a4 4 0 014 4v2m4-13v8m-4-4h8" })),
-                                    SP_REACT.createElement(PartyRowButton, { label: "Leave party", disabled: busy || voice.stopping,
+                                    SP_REACT.createElement(PartyRowButton, { label: t("Leave party"), disabled: busy || voice.stopping,
                                         onClick: () => partyAction(async () => {
                                             if (voice.activeParty === party.id) await voice.stop();
                                             await api.leave(party.id);
-                                        }, "Party left.") },
+                                        }, t("Party left.")) },
                                         SP_REACT.createElement("path", { d: "M10 4H4v16h6m-1-8h12m-4-4 4 4-4 4" }))) :
                                     SP_REACT.createElement(DFL.Focusable, { "flow-children": "row", style: { display: "flex", gap: 6 } },
                                         partyIndex === 0 && !voice.activeParty && !parties.some(room => room.members.some(player => player.id === session.me.id)) &&
                                             SP_REACT.createElement(PartyCreateButtons, { disabled: busy || voice.stopping,
-                                                create: friends => partyAction(() => api.createParty(friends), "Party created.", true) }),
+                                                create: friends => partyAction(() => api.createParty(friends), t("Party created."), true) }),
                                         !party.members.length && joinButton)),
-                            party.members.map((player, index) => SP_REACT.createElement(PartyMemberRow, { key: player.id, action: index === 0 ? joinButton : undefined,
+                            orderedMembers.map((player, index) => SP_REACT.createElement(PartyMemberRow, { key: player.id, action: index === 0 ? joinButton : undefined,
                                 player: partyMemberPresentation(player, [session.me, ...session.friends].find(friend => friend.id === player.id), {
                                     self: player.id === session.me.id, active: voice.activeParty === party.id,
                                     connected: voice.status?.party === party.id && voice.status.connected,
                                     failed: voice.status?.party === party.id && voice.status.error,
-                                    peerStates: voice.peerStates, muted: voice.muted, startedAt: voice.startedAt,
+                                    peerStates: voice.peerStates, muted: voice.muted, startedAt: voice.startedAt, speaking,
                                 }) })),
-                            voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, voice.muteError)));
+                            voice.activeParty === party.id && voice.muteError && SP_REACT.createElement("div", { role: "alert" }, translateError(voice.muteError))));
                 }))));
 }
 const pluginIcon = SP_REACT.createElement("svg", { width: "1em", height: "1em", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.6", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
@@ -1894,6 +2175,7 @@ const pluginIcon = SP_REACT.createElement("svg", { width: "1em", height: "1em", 
     SP_REACT.createElement("path", { d: "m2 14 8 8m0-8-8 8" }),
     SP_REACT.createElement("rect", { x: 14, y: 14, width: 8, height: 8, rx: 0.4 }));
 var index = definePlugin(() => {
+    void initializeLanguage();
     const routerHook = api$1.routerHook;
     const partyRoute = "/playdeck/party";
     const menuRoute = "/playdeck";
@@ -1921,7 +2203,7 @@ var index = definePlugin(() => {
         }, onFocus: event => {
             if (event.currentTarget !== event.target)
                 event.target.scrollIntoView({ block: "nearest", inline: "nearest" });
-        } }, SP_REACT.createElement(SocialPanel, props));
+        } }, SP_REACT.createElement(SocialPanel, { ...props, menuVisibility }));
     }
     function SocialPopup({ closeModal }) {
         return SP_REACT.createElement(DFL.ModalRoot, { closeModal, onCancel: closeModal, bAllowFullSize: true, modalClassName: "playdeck-social-popup" },
@@ -1939,7 +2221,7 @@ var index = definePlugin(() => {
                     event.target.scrollIntoView({ block: "nearest", inline: "nearest" });
             } },
                 SP_REACT.createElement("h1", { style: { margin: "0 12px 12px" } }, "PlayDeck"),
-                SP_REACT.createElement(SocialPanel, { onOpenParty: () => openRoute(partyRoute) })));
+                SP_REACT.createElement(SocialPanel, { menuVisibility, onOpenParty: () => openRoute(partyRoute) })));
     }
     function SteamMenuPopupRoute() {
         SP_REACT.useEffect(() => {
@@ -1959,10 +2241,13 @@ var index = definePlugin(() => {
     routerHook.addRoute(menuRoute, SteamMenuPopupRoute, { exact: true });
     routerHook.addRoute(settingsRoute, () => routePanel({ settingsOnOpen: true }), { exact: true });
     let menuPosition = 3;
+    let menuEnabled = true;
+    let removeMenu;
     try {
         const saved = Number(localStorage.getItem("PLAYDECK_MENU_POSITION") ?? 3);
         if (Number.isInteger(saved) && saved >= 1 && saved <= 9)
             menuPosition = saved;
+        menuEnabled = localStorage.getItem("PLAYDECK_MENU_ENABLED") !== "false";
     } catch { /* Keep the default position if storage is unavailable. */ }
     function chooseMenuPosition() {
         const dropdown = new DFL.Dropdown({
@@ -1973,24 +2258,36 @@ var index = definePlugin(() => {
                     localStorage.setItem("PLAYDECK_MENU_POSITION", String(data));
                     menuPosition = data;
                 } catch {
-                    api$1.toaster.toast({ title: "PlayDeck", body: "Could not save Steam menu position." });
+                    api$1.toaster.toast({ title: "PlayDeck", body: t("Could not save Steam menu position.") });
                 }
             },
         });
         dropdown.ShowMenu();
     }
-    const removeMenu = installSteamMainMenuEntry(menuRoute, pluginIcon, () => menuPosition,
-        chooseMenuPosition, () => openRoute(settingsRoute));
+    function updateMenuEntry() {
+        removeMenu?.();
+        removeMenu = menuEnabled ? installSteamMainMenuEntry(menuRoute, pluginIcon, () => menuPosition,
+            chooseMenuPosition, () => openRoute(settingsRoute)) : undefined;
+    }
+    const menuVisibility = {
+        get enabled() { return menuEnabled; },
+        setEnabled(enabled) {
+            localStorage.setItem("PLAYDECK_MENU_ENABLED", String(enabled));
+            menuEnabled = enabled;
+            updateMenuEntry();
+        },
+    };
+    updateMenuEntry();
     return {
         name: "PlayDeck",
         titleView: SP_REACT.createElement("div", { className: DFL.staticClasses.Title }, "PlayDeck"),
-        content: SP_REACT.createElement(SocialPanel, null),
+        content: SP_REACT.createElement(SocialPanel, { menuVisibility }),
         icon: pluginIcon,
         onDismount() {
             disposed = true;
             closePopup();
             void voiceSnapshot.stop();
-            removeMenu();
+            removeMenu?.();
             partyBadge.remove();
             partyBadge = undefined;
             routerHook.removeGlobalComponent("playdeck-voice");

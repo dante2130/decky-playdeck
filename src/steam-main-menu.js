@@ -1,4 +1,5 @@
 // Adapted from nexus-social, MIT, Xodus Nexus contributors.
+import { t } from "./i18n.js";
 const { findInReactTree, getReactRoot } = DFL;
 const { createElement } = SP_REACT;
 const registryKey = "__necroSteamMenuV1";
@@ -124,9 +125,9 @@ export function installSteamMainMenuEntry(route, icon, getPosition, onSecondary,
     const entry = {
         id: "playdeck", route, icon, order: 40,
         label: "PlayDeck", onSecondary, onOptions,
-        optionsActionDescription: "PlayDeck settings",
+        get optionsActionDescription() { return t("PlayDeck settings"); },
         get position() { return getPosition(); },
-        get secondaryActionDescription() { return "Change menu position"; },
+        get secondaryActionDescription() { return t("Change menu position"); },
     };
     registry.entries.set(entry.id, entry);
     const stopRetrying = () => {

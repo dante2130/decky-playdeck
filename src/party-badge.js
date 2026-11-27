@@ -1,11 +1,13 @@
 // Adapted from nexus-social, MIT, Xodus Nexus contributors.
+import { t, useLanguage } from "./i18n.js";
 const { afterPatch, findClassModule, findModule, Focusable } = DFL;
 const { cloneElement, createElement, useEffect, useState, useSyncExternalStore } = SP_REACT;
 const headerClasses = findClassModule(value => value.HeaderItem && value.Clickable && value.Clock);
 const badgeKey = "playdeck-party-badge";
 function PartyBadge({ count, onOpen, native }) {
+    useLanguage();
     const [focused, setFocused] = useState(false);
-    const label = `Open PlayStation party, ${count} ${count === 1 ? "member" : "members"}`;
+    const label = t("Open PlayStation party ({count})", { count });
     const className = [headerClasses?.HeaderItem, headerClasses?.Clickable, focused && "playdeck-party-focused"].filter(Boolean).join(" ");
     const style = {
         display: "inline-flex", alignItems: "center", justifyContent: "center", position: "relative",
@@ -36,7 +38,7 @@ function PartyBadge({ count, onOpen, native }) {
             } }, count));
     if (!native)
         return SP_REACT.createElement("button", { type: "button", tabIndex: -1, className: className, "data-playdeck-party-badge": true, "aria-label": label, style: style, onMouseDown: event => event.preventDefault(), onClick: onOpen }, content);
-    return SP_REACT.createElement(Focusable, { noFocusRing: true, className: className, role: "button", "data-playdeck-party-badge": true, onGamepadFocus: () => setFocused(true), onGamepadBlur: () => setFocused(false), onMouseEnter: () => setFocused(false), onMouseMove: () => setFocused(false), onOKActionDescription: "Open PlayStation party", onActivate: onOpen, onClick: onOpen, "aria-label": label, style: style }, content);
+    return SP_REACT.createElement(Focusable, { noFocusRing: true, className: className, role: "button", "data-playdeck-party-badge": true, onGamepadFocus: () => setFocused(true), onGamepadBlur: () => setFocused(false), onMouseEnter: () => setFocused(false), onMouseMove: () => setFocused(false), onOKActionDescription: t("Open PlayStation party"), onActivate: onOpen, onClick: onOpen, "aria-label": label, style: style }, content);
 }
 function headerNavigationProviders(header) {
     const fiberKey = Object.keys(header).find(key => key.startsWith("__reactFiber$"));
